@@ -1,14 +1,24 @@
 {
   "name": "ship-autopilot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "File-backed autonomous development controller using OMP as disposable coding workers.",
   "type": "module",
-  "bin": { "ship": "./src/cli.ts" },
+  "bin": {
+    "ship": "./src/cli.ts"
+  },
   "scripts": {
     "ship": "node --no-warnings --experimental-strip-types src/cli.ts",
     "test": "node --no-warnings --experimental-strip-types --test test/*.test.ts",
-    "check": "node --no-warnings --experimental-strip-types src/cli.ts --help"
+    "check": "tsc --noEmit",
+    "demo": "node --no-warnings --experimental-strip-types scripts/demo.ts",
+    "smoke": "node --no-warnings --experimental-strip-types scripts/smoke.ts"
   },
-  "engines": { "node": ">=22.6" },
-  "license": "MIT"
+  "engines": {
+    "node": ">=22.6"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "25.1.0",
+    "typescript": "5.8.3"
+  }
 }

@@ -1,76 +1,94 @@
-#!/usr/bin/env -S node --no-warnings --experimental-strip-types
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+#!/usr/bin/env -S node --experimental-strip-types
+import { mkdir, readFile, writeFile, open, realpath } from "node:fs/promises";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { spawn, spawnSync } from "node:child_process";
 import { Controller } from "./controller.ts";
 import { OmpRpcWorker } from "./rpc-worker.ts";
-import { appendEvent, atomicJson, configPath, exists, loadConfig, loadState, saveState, shipDir, statePath, writeRoadmapView } from "./store.ts";
-import { ensureGitRepo, ensureShipExcluded } from "./git.ts";
+import { atomicJson, configPath, exists, loadConfig, loadState, queueMessage, saveState, shipDir, statePath, writeRoadmapView } from "./store.ts";
+import { ensureGitRepo, ensureShipExcluded, git } from "./git.ts";
+import { recoverLock } from "./lock.ts";
+import { tui } from "./tui.ts";
 import type { ShipConfig, ShipState } from "./types.ts";
 
-const args = process.argv.slice(2);
-const command = args[0];
-const root = process.cwd();
-
-function usage() {
-  console.log(`Ship Autopilot MVP\n\nCommands:\n  ship init --brief <file>\n  ship run [--once] [--max-runtime 8h]\n  ship status [--json]\n  ship pause\n  ship capture "<note>"\n  ship doctor`);
+export function parseDuration(value: string): number {
+  const m = /^(\d+)(ms|s|m|h)$/.exec(value);
+  if (!m) throw new Error(`Invalid duration: ${value}`);
+  const duration = Number(m[1]) * ({ ms: 1, s: 1000, m: 60000, h: 3600000 } as Record<string, number>)[m[2]];
+  if (!Number.isSafeInteger(duration) || duration <= 0 || duration > 2_147_483_647) throw new Error("Duration must be positive and less than 25 days");
+  return duration;
 }
-
-function flag(name: string): string | undefined { const i = args.indexOf(name); return i >= 0 ? args[i+1] : undefined; }
-function parseDuration(value = "8h"): number { const m = /^(\d+)(ms|s|m|h)$/.exec(value); if(!m) throw new Error(`Invalid duration: ${value}`); const n=Number(m[1]); return n*({ms:1,s:1000,m:60000,h:3600000} as any)[m[2]]; }
-
-async function init() {
-  const briefFile = flag("--brief"); if (!briefFile) throw new Error("init requires --brief <file>");
-  if (await exists(statePath(root))) throw new Error(".ship already exists; refusing to overwrite state");
+export async function initialize(root: string, briefFile: string): Promise<void> {
+  if (await exists(shipDir(root))) throw new Error(".ship already exists; refusing to overwrite it");
   const brief = await readFile(path.resolve(root, briefFile), "utf8");
-  await ensureGitRepo(root); await ensureShipExcluded(root); await mkdir(shipDir(root), { recursive: true });
-  await writeFile(path.join(shipDir(root), "PROJECT.md"), brief, "utf8");
-  await writeFile(path.join(shipDir(root), "KNOWLEDGE.md"), "# Knowledge\n\n## Constraints\n\n## Decisions\n\n## Assumptions\n\n## Lessons\n", "utf8");
-  const config: ShipConfig = { schemaVersion:1, worker:{ command:"omp", args:["--mode","rpc","--no-session","--no-ui"], startupTimeoutMs:15000, inactivityTimeoutMs:10*60_000, hardTimeoutMs:60*60_000 }, limits:{ maxTaskAttempts:3, maxDispatches:100 } };
+  if (!brief.trim()) throw new Error("Brief is empty");
+  await ensureGitRepo(root); await ensureShipExcluded(root);
+  await mkdir(shipDir(root));
+  await writeFile(path.join(shipDir(root), "PROJECT.md"), brief);
+  const config: ShipConfig = {
+    schemaVersion: 1,
+    worker: { command: "omp", args: ["--mode", "rpc", "--no-session", "--no-ui"], startupTimeoutMs: 15000, inactivityTimeoutMs: 600000, hardTimeoutMs: 3600000 },
+    limits: { maxTaskAttempts: 3, maxDispatches: 100 }, verificationTimeoutMs: 300000, protectedChecks: [], review: true,
+  };
   const now = new Date().toISOString();
-  const state: ShipState = { schemaVersion:1, projectName:path.basename(root), phase:"idle", roadmapRevision:0, milestones:[], paused:false, lastProgressAt:now, createdAt:now, updatedAt:now };
-  await atomicJson(configPath(root), config); await saveState(root, state); await writeRoadmapView(root, state); await appendEvent(root, {type:"initialized"});
-  console.log("Initialized .ship/. Run `ship doctor`, then `ship run`. ");
+  const state: ShipState = { schemaVersion: 1, projectName: path.basename(root), phase: "idle", roadmapRevision: 0, milestones: [], paused: false, lastProgressAt: now, createdAt: now, updatedAt: now };
+  await atomicJson(configPath(root), config); await saveState(root, state); await writeRoadmapView(root, state);
 }
-
-async function run() {
-  const config = await loadConfig(root); const worker = new OmpRpcWorker(config); const controller = new Controller(root, worker);
-  const once = args.includes("--once"); const deadline = Date.now() + parseDuration(flag("--max-runtime") ?? "8h");
-  let dispatches = 0;
-  while (Date.now() < deadline && dispatches < config.limits.maxDispatches) {
-    const r = await controller.step(); dispatches++; console.log(`[ship] ${r} (${dispatches} dispatches)`);
-    if (once || r === "complete" || r === "blocked") break;
-  }
+export async function startDetached(root: string, args: string[] = []): Promise<string> {
+  await loadState(root);
+  if (await exists(path.join(shipDir(root), "lock"))) throw new Error("A controller lock exists; attach or recover before starting another controller");
+  const logDir = path.join(shipDir(root), "logs"); await mkdir(logDir, { recursive: true });
+  const log = await open(path.join(logDir, "controller.log"), "a", 0o600);
+  try {
+    const child = spawn(process.execPath, ["--no-warnings", "--experimental-strip-types", fileURLToPath(import.meta.url), "run", ...args], { cwd: root, detached: true, stdio: ["ignore", log.fd, log.fd] });
+    await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+    child.unref(); return `Controller launched (PID ${child.pid}); startup errors appear in .ship/logs/controller.log`;
+  } finally { await log.close(); }
 }
-
-async function status() {
-  const state = await loadState(root);
-  if (args.includes("--json")) return console.log(JSON.stringify(state, null, 2));
-  console.log(`${state.projectName}: ${state.phase}${state.paused ? " (paused)" : ""}`);
-  console.log(`roadmap revision ${state.roadmapRevision}; last progress ${state.lastProgressAt}`);
-  if (state.current) console.log(`current: ${state.current.milestoneId}/${state.current.sliceId}/${state.current.taskId ?? "-"}`);
-  if (state.blockedReason) console.log(`blocked: ${state.blockedReason}`);
-  for (const m of state.milestones) console.log(`- ${m.id} ${m.title}: ${m.status}`);
+function usage() {
+  console.log(`Ship 0.2 — file-backed autonomous controller\n\nship                         open the TUI\nship init --brief <file>      initialize without model calls\nship run [--once] [--detach] [--max-runtime 8h]\nship tui                     attach; q detaches without stopping the run\nship status [--json]\nship pause | resume          queue control at a safe boundary\nship capture "<note>"\nship recover                 unlock a confirmed-dead controller\nship doctor                  no paid model calls`);
 }
-
-async function pause() { const s=await loadState(root); s.paused=true; await saveState(root,s); await appendEvent(root,{type:"pause_requested"}); console.log("Pause requested."); }
-async function capture() { const note=args.slice(1).join(" ").trim(); if(!note) throw new Error("capture requires a note"); const dir=path.join(shipDir(root),"inbox"); await mkdir(dir,{recursive:true}); const file=path.join(dir,`${Date.now()}-${process.pid}.json`); await atomicJson(file,{type:"capture",note,at:new Date().toISOString()}); console.log("Capture queued."); }
-async function doctor() {
-  const checks: [string, boolean, string][] = [];
-  checks.push([".ship state", await exists(statePath(root)), statePath(root)]);
-  const git = spawnSync("git", ["rev-parse","--is-inside-work-tree"], {cwd:root,encoding:"utf8"}); checks.push(["git repository", git.status===0, git.stderr.trim()]);
-  const omp = spawnSync("omp", ["--version"], {cwd:root,encoding:"utf8"}); checks.push(["OMP executable", omp.status===0, omp.status===0 ? omp.stdout.trim() : "not found"]);
-  for (const [name,ok,detail] of checks) console.log(`${ok?"✓":"✗"} ${name}${detail?`: ${detail}`:""}`);
-  if (checks.some(x=>!x[1])) process.exitCode=1;
+export async function main(args: string[], root: string): Promise<void> {
+  root = await realpath(root);
+  const command = args[0];
+  const value = (flag: string) => { const index = args.indexOf(flag); if (index < 0) return undefined; const result = args[index + 1]; if (!result || result.startsWith("--")) throw new Error(`Missing value for ${flag}`); return result; };
+  if (command === "--help" || command === "-h") return usage();
+  if (!command || command === "tui") return tui(root, () => startDetached(root));
+  if (command === "init") { const brief = value("--brief"); if (!brief) throw new Error("init requires --brief <file>"); await initialize(root, brief); console.log("Initialized .ship/. Commit the project baseline, then run ship doctor."); }
+  else if (command === "status") {
+    const s = await loadState(root);
+    console.log(args.includes("--json") ? JSON.stringify(s, null, 2) : `${s.projectName}: ${s.phase}${s.paused ? " (paused)" : ""}\nRoadmap r${s.roadmapRevision}; ${s.dispatches ?? 0} dispatches\nWorktree: ${s.workspace?.path ?? "not started"}\n${s.blockedReason ?? ""}`);
+  } else if (command === "pause" || command === "resume" || command === "capture") {
+    await queueMessage(root, command, command === "capture" ? args.slice(1).join(" ") : undefined); console.log(`${command} queued.`);
+  } else if (command === "recover") { await recoverLock(root); console.log("Dead-controller lock cleared. Run ship run to reconcile persisted work."); }
+  else if (command === "run") {
+    for (let i = 1; i < args.length; i++) {
+      if (["--once", "--detach"].includes(args[i])) continue;
+      if (args[i] === "--max-runtime") { i++; continue; }
+      throw new Error(`Unknown run option: ${args[i]}`);
+    }
+    const duration = parseDuration(value("--max-runtime") ?? "8h");
+    if (args.includes("--detach")) { console.log(await startDetached(root, args.slice(1).filter(x => x !== "--detach"))); return; }
+    const config = await loadConfig(root), abort = new AbortController();
+    const stop = () => abort.abort(); process.once("SIGINT", stop); process.once("SIGTERM", stop);
+    const deadline = setTimeout(stop, duration);
+    try {
+      const c = new Controller(root, new OmpRpcWorker(config), { signal: abort.signal });
+      let last = "";
+      const result = await c.run(args.includes("--once"), step => { if (step !== "paused" || step !== last) console.log(`[ship] ${step}`); last = step; });
+      if (result === "blocked") process.exitCode = 2;
+    } finally { clearTimeout(deadline); process.off("SIGINT", stop); process.off("SIGTERM", stop); }
+  } else if (command === "doctor") {
+    const checks: [string, boolean, string][] = [];
+    try { await loadState(root); checks.push(["State schema", true, ""]); } catch (e) { checks.push(["State schema", false, String(e)]); }
+    try { await git(root, ["rev-parse", "HEAD"]); await git(root, ["var", "GIT_AUTHOR_IDENT"]); checks.push(["Git baseline and author", true, ""]); } catch (e) { checks.push(["Git baseline and author", false, String(e)]); }
+    try { const c = await loadConfig(root); const version = spawnSync(c.worker.command, ["--version"], { encoding: "utf8", timeout: 5000 }); checks.push(["Worker executable", version.status === 0, version.stdout?.trim() || version.error?.message || version.stderr?.trim()]); } catch (e) { checks.push(["Worker configuration", false, String(e)]); }
+    checks.push(["POSIX process groups", process.platform !== "win32", "Linux/macOS; use WSL2 on Windows"]);
+    for (const [name, ok, detail] of checks) console.log(`${ok ? "OK" : "FAIL"} ${name}${detail ? `: ${detail}` : ""}`);
+    console.log("No live model call was made. Executable availability is not an OMP compatibility or authentication test.");
+    if (checks.some(x => !x[1])) process.exitCode = 1;
+  } else throw new Error(`Unknown command: ${command}`);
 }
-
-try {
-  if (!command || command === "--help" || command === "-h") usage();
-  else if (command === "init") await init();
-  else if (command === "run") await run();
-  else if (command === "status") await status();
-  else if (command === "pause") await pause();
-  else if (command === "capture") await capture();
-  else if (command === "doctor") await doctor();
-  else throw new Error(`Unknown command: ${command}`);
-} catch (e:any) { console.error(`ship: ${e.message}`); process.exitCode=1; }
+if (process.argv[1] && (await realpath(process.argv[1]).catch(() => "")) === fileURLToPath(import.meta.url)) {
+  main(process.argv.slice(2), process.cwd()).catch(error => { console.error(`ship: ${error.message}`); process.exitCode = 1; });
+}
