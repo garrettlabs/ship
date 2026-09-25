@@ -5,10 +5,11 @@ import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { Controller } from "./controller.ts";
 import { OmpRpcWorker } from "./rpc-worker.ts";
-import { atomicJson, configPath, exists, loadConfig, loadState, queueMessage, saveState, shipDir, statePath, writeRoadmapView } from "./store.ts";
+import { atomicJson, configPath, exists, loadConfig, loadState, queueMessage, queueWorkDecision, saveState, shipDir, statePath, writeRoadmapView } from "./store.ts";
 import { ensureGitRepo, ensureShipExcluded, git } from "./git.ts";
 import { recoverLock } from "./lock.ts";
-import { tui } from "./tui.ts";
+import { describeRequest } from "./work.ts";
+import { safe, tui } from "./tui.ts";
 import type { ShipConfig, ShipState } from "./types.ts";
 
 export function parseDuration(value: string): number {
@@ -46,7 +47,7 @@ export async function startDetached(root: string, args: string[] = []): Promise<
   } finally { await log.close(); }
 }
 function usage() {
-  console.log(`Ship 0.2 — file-backed autonomous controller\n\nship                         open the TUI\nship init --brief <file>      initialize without model calls\nship run [--once] [--detach] [--max-runtime 8h]\nship tui                     attach; q detaches without stopping the run\nship status [--json]\nship pause | resume          queue control at a safe boundary\nship capture "<note>"\nship recover                 unlock a confirmed-dead controller\nship doctor                  no paid model calls`);
+  console.log(`Ship 0.2 — file-backed autonomous controller\n\nship                         open the TUI\nship init --brief <file>      initialize without model calls\nship run [--once] [--detach] [--max-runtime 8h]\nship tui                     attach; q detaches without stopping the run\nship status [--json]\nship pause | resume          queue control at a safe boundary\nship capture "<note>"\nship add "<request>"          queue new requested work, not a capture\nship proposals [W0001] [--json]\nship approve W0001 | reject W0001\nship recover                 unlock a confirmed-dead controller\nship doctor                  no paid model calls`);
 }
 export async function main(args: string[], root: string): Promise<void> {
   root = await realpath(root);
@@ -57,9 +58,25 @@ export async function main(args: string[], root: string): Promise<void> {
   if (command === "init") { const brief = value("--brief"); if (!brief) throw new Error("init requires --brief <file>"); await initialize(root, brief); console.log("Initialized .ship/. Commit the project baseline, then run ship doctor."); }
   else if (command === "status") {
     const s = await loadState(root);
-    console.log(args.includes("--json") ? JSON.stringify(s, null, 2) : `${s.projectName}: ${s.phase}${s.paused ? " (paused)" : ""}\nRoadmap r${s.roadmapRevision}; ${s.dispatches ?? 0} dispatches\nWorktree: ${s.workspace?.path ?? "not started"}\n${s.blockedReason ?? ""}`);
-  } else if (command === "pause" || command === "resume" || command === "capture") {
-    await queueMessage(root, command, command === "capture" ? args.slice(1).join(" ") : undefined); console.log(`${command} queued.`);
+    console.log(args.includes("--json") ? JSON.stringify(s, null, 2) : `${s.projectName}: ${s.phase}${s.paused ? " (paused)" : ""}\nRoadmap r${s.roadmapRevision}; ${s.dispatches ?? 0} dispatches\nWorktree: ${s.workspace?.path ?? "not started"}\n${s.blockedReason ?? ""}\nWork requests: ${(s.workRequests ?? []).filter(r => r.status !== "applied" && r.status !== "rejected").length} unresolved; ship proposals for details`);
+  } else if (command === "proposals") {
+    const positional = args.slice(1).filter(x => x !== "--json");
+    if (positional.length > 1 || positional.some(x => !/^W[0-9]{2,}$/.test(x))) throw new Error("Usage: ship proposals [W0001] [--json]");
+    const all = (await loadState(root)).workRequests!, requestId = positional[0];
+    const selected = requestId ? all.filter(r => r.id === requestId) : all;
+    if (requestId && !selected.length) throw new Error(`Unknown work request: ${requestId}`);
+    if (args.includes("--json")) console.log(JSON.stringify(selected, null, 2));
+    else {
+      console.log(selected.length ? selected.map(r => describeRequest(r).map(safe).join("\n")).join("\n\n") : "No consumed work requests yet. Start ship run to process queued additions.");
+      console.log("\nInspect new commands before ship approve W0001. Use ship reject W0001 to discard. Decisions apply at a safe boundary.");
+    }
+  } else if (command === "approve" || command === "reject") {
+    if (args.length !== 2 || !/^W[0-9]{2,}$/.test(args[1])) throw new Error(`Usage: ship ${command} W0001`);
+    await queueWorkDecision(root, command, args[1]);
+    console.log(`${command} queued for ${args[1]}. Start ship run if the controller has exited.`);
+  } else if (command === "pause" || command === "resume" || command === "capture" || command === "add") {
+    await queueMessage(root, command, command === "capture" || command === "add" ? args.slice(1).join(" ") : undefined);
+    console.log(command === "add" ? "Work request queued. The running controller will propose a task, slice, or milestone at a safe boundary. Start ship run if needed; inspect ship proposals before approving." : `${command} queued.`);
   } else if (command === "recover") { await recoverLock(root); console.log("Dead-controller lock cleared. Run ship run to reconcile persisted work."); }
   else if (command === "run") {
     for (let i = 1; i < args.length; i++) {
@@ -75,7 +92,7 @@ export async function main(args: string[], root: string): Promise<void> {
     try {
       const c = new Controller(root, new OmpRpcWorker(config), { signal: abort.signal });
       let last = "";
-      const result = await c.run(args.includes("--once"), step => { if (step !== "paused" || step !== last) console.log(`[ship] ${step}`); last = step; });
+      const result = await c.run(args.includes("--once"), step => { if ((step !== "paused" && step !== "waiting") || step !== last) console.log(`[ship] ${step}`); last = step; });
       if (result === "blocked") process.exitCode = 2;
     } finally { clearTimeout(deadline); process.off("SIGINT", stop); process.off("SIGTERM", stop); }
   } else if (command === "doctor") {

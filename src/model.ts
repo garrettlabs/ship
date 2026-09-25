@@ -31,6 +31,17 @@ export function validatePlan(value: unknown): asserts value is Milestone[] {
     unique(m.slices as Milestone["slices"]);
   }
   unique(value);
+  // Serial scheduling is intentional. Requiring prerequisites to precede their
+  // consumer rejects missing, forward, self, and cyclic dependencies.
+  const preceding = new Set<string>();
+  for (const m of value) for (const s of m.slices) for (const t of s.tasks) {
+    if (t.dependsOn !== undefined) {
+      strings(t.dependsOn, "dependsOn");
+      if (new Set(t.dependsOn).size !== t.dependsOn.length) throw new Error("Duplicate dependency");
+      for (const key of t.dependsOn) if (!preceding.has(key)) throw new Error(`Dependency must name an earlier task: ${key}`);
+    }
+    preceding.add(`${m.id}/${s.id}/${t.id}`);
+  }
 }
 export function parsePlan(output: string): Milestone[] {
   const raw: unknown = JSON.parse(output.trim()); object(raw); validatePlan(raw.milestones);

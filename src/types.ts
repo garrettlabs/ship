@@ -1,12 +1,12 @@
 export type TaskStatus = "pending" | "running" | "verifying" | "passed" | "failed" | "blocked";
-export type RunPhase = "idle" | "planning" | "executing" | "verifying" | "reviewing" | "blocked" | "complete";
+export type RunPhase = "idle" | "planning" | "executing" | "verifying" | "reviewing" | "waiting" | "blocked" | "complete";
 export interface Task {
   id: string; title: string; goal: string; acceptance: string[];
-  verificationCommands: string[]; status: TaskStatus; attempts: number; lastError?: string;
+  verificationCommands: string[]; dependsOn?: string[]; requestedBy?: WorkOrigin; status: TaskStatus; attempts: number; lastError?: string;
 }
-export interface Slice { id: string; title: string; status: "pending" | "active" | "complete"; tasks: Task[]; }
+export interface Slice { id: string; title: string; status: "pending" | "active" | "complete"; tasks: Task[]; requestedBy?: WorkOrigin; }
 export interface Milestone {
-  id: string; title: string; outcome: string; status: "pending" | "active" | "complete"; slices: Slice[];
+  id: string; title: string; outcome: string; status: "pending" | "active" | "complete"; slices: Slice[]; requestedBy?: WorkOrigin;
 }
 export interface Knowledge {
   id: string; kind: "capture" | "observation" | "decision" | "assumption" | "lesson";
@@ -23,7 +23,7 @@ export interface ShipState {
   workspace?: { path: string; branch: string; baseHead: string };
   lastHead?: string; partialTree?: string; activeAttempt?: Attempt; dispatches?: number; planningFailures?: number;
   reviewedSlices?: string[]; reviewAttempts?: Record<string, number>;
-  knowledge?: Knowledge[]; processedInbox?: string[];
+  knowledge?: Knowledge[]; processedInbox?: string[]; workRequests?: WorkRequest[];
 }
 export interface ShipConfig {
   schemaVersion: 1;
@@ -39,3 +39,30 @@ export interface Review {
   lessons: { kind: "observation" | "decision" | "assumption" | "lesson"; text: string; evidence: string }[];
   changes: { task: string; goal: string; reason: string }[];
 }
+
+// New work remains a request until an exact planner proposal is approved.
+export interface WorkOrigin { source: "user"; requestId: string; proposalId: string; }
+export interface NewTask {
+  id: string; title: string; goal: string; acceptance: string[];
+  verificationCommands: string[]; dependsOn?: string[];
+}
+export interface NewSlice { id: string; title: string; tasks: NewTask[]; }
+export interface NewMilestone { id: string; title: string; outcome: string; slices: NewSlice[]; }
+export type Addition =
+  | { type: "ADD_TASK"; parent: string; after: string | null; task: NewTask }
+  | { type: "ADD_SLICE"; parent: string; after: string | null; slice: NewSlice }
+  | { type: "ADD_MILESTONE"; after: string | null; milestone: NewMilestone };
+export interface AdditionProposal {
+  revision: number; requestId: string; rationale: string; patch: Addition;
+}
+export interface WorkProposal extends AdditionProposal { id: string; }
+export interface WorkRequest {
+  id: string; text: string; source: "user"; inboxId: string; createdAt: string;
+  status: "queued" | "planning" | "proposed" | "applied" | "rejected" | "conflict" | "failed" | "stale";
+  attempts: number; proposal?: WorkProposal; error?: string; resolvedAt?: string;
+  appliedRevision?: number;
+}
+export type InboxMessage = {
+  id: string; type: "pause" | "resume" | "capture" | "add" | "approve" | "reject";
+  note?: string; requestId?: string; proposalId?: string; at: string;
+};
