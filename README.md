@@ -1,135 +1,62 @@
-# Ship Autopilot MVP
+# Ship Autopilot
 
-Ship is a file-backed autonomous development controller that uses Oh My Pi (OMP) as a disposable coding-agent harness.
+Early MVP of a file-backed autonomous development controller that treats OMP as a disposable coding worker.
 
-The current MVP focuses on the first reliable vertical slice:
+## What works today
 
-- initialize durable project state from a brief,
-- plan the first milestone/slice/task through a worker,
-- execute one task in a fresh worker,
-- run acceptance checks in the controller,
-- retry bounded failures,
-- commit only after verification passes,
-- persist state and an append-only event log,
-- expose status/pause/capture/doctor commands.
-
-It intentionally does **not** yet implement the full adaptive slice/milestone replanning loop.
+- `.ship/` initialization from a project brief.
+- Deterministic controller state persisted in JSON plus an append-only event log.
+- OMP RPC subprocess adapter that waits for `prompt_result` and session settlement rather than confusing command acknowledgement with completion.
+- Just-in-time initial roadmap generation.
+- One-task-at-a-time execution with fresh OMP processes.
+- Controller-owned acceptance commands, bounded retries, Git commits, and resumable task state.
+- `.ship/` is added to the repository-local Git exclude file so controller state is not swept into task commits.
+- `status`, `pause`, `capture`, and `doctor` CLI surfaces.
+- Offline tests with a fake worker.
 
 ## Requirements
 
-- Node.js 22+
-- Git
-- OMP available as `omp` for live use
+- Node.js 22.6+ (this MVP uses Node's built-in TypeScript type stripping).
+- Git.
+- OMP for live runs: https://github.com/can1357/oh-my-pi
 
-No npm install is currently required; the MVP uses Node's built-in TypeScript stripping and test runner.
-
-## Quick start
-
-```bash
-git init my-project
-cd my-project
-git config user.name "Your Name"
-git config user.email "you@example.com"
-
-# Put this repo somewhere and call its CLI directly:
-node /path/to/ship/src/cli.ts init --brief ./brief.md
-node /path/to/ship/src/cli.ts status
-node /path/to/ship/src/cli.ts run --once --worker fake
-```
-
-For live OMP:
-
-```bash
-node /path/to/ship/src/cli.ts doctor --worker omp
-node /path/to/ship/src/cli.ts run --once
-```
-
-The live adapter starts:
-
-```bash
-omp --mode rpc --no-session
-```
-
-and waits for RPC `prompt_result`; if OMP reports `work_pending`, it also waits for `session_settled` before recycling the worker.
-
-## CLI
-
-```text
-ship init --brief <file>
-ship run [--once] [--max-runtime 8h] [--worker omp|fake]
-ship status [--json]
-ship pause
-ship capture "<note>"
-ship doctor [--worker omp|fake]
-```
-
-`pause` and `capture` are persisted to `.ship/inbox/`. Consumption of those messages by the run loop is a next-MVP item.
-
-## Durable state
-
-A project gets:
-
-```text
-.ship/
-  PROJECT.md
-  ROADMAP.md
-  KNOWLEDGE.md
-  config.json
-  state.json
-  events.jsonl
-  attempts/
-  inbox/
-  logs/
-```
-
-The controller also writes `.git/info/exclude` entries for `.ship/` and `.ship-worktree/` so controller state is not swept into task commits without modifying the project's committed `.gitignore`.
-
-`state.json` is the authoritative snapshot. Writes use temp-file + rename replacement. `events.jsonl` is an audit trail.
-
-## Current execution model
-
-The controller:
-
-1. asks a worker for an initial structured roadmap if none exists,
-2. selects the next pending task,
-3. marks an attempt running,
-4. invokes a fresh worker,
-5. runs the task's acceptance commands itself,
-6. retries failures up to the configured attempt limit,
-7. commits verified source changes with a stable task/attempt marker,
-8. marks the task complete only after the commit exists.
-
-A worker saying "success" is never sufficient for acceptance.
-
-## Tests
+## Try it
 
 ```bash
 npm test
+npm run ship -- --help
+
+mkdir /tmp/my-project && cd /tmp/my-project
+git init -b main
+cp /path/to/brief.md brief.md
+node --experimental-strip-types /path/to/ship-autopilot/src/cli.ts init --brief brief.md
+node --experimental-strip-types /path/to/ship-autopilot/src/cli.ts doctor
+node --experimental-strip-types /path/to/ship-autopilot/src/cli.ts run --once
 ```
 
-The offline suite covers:
+For a live run, `omp` must be on PATH and authenticated.
 
-- multiple tasks across two milestones,
-- failed verification followed by a successful repair,
-- the RPC lifecycle using a fake OMP subprocess,
-- waiting for `session_settled` when work is pending.
+## State model
 
-The fake worker is deliberately simple and deterministic. It is for controller tests, not a simulation of model quality.
+`.ship/state.json` is the authoritative workflow snapshot. `.ship/events.jsonl` is an audit log. `.ship/ROADMAP.md` is a generated human-readable projection. Attempt summaries are immutable-ish records under `.ship/attempts/`.
 
-## OMP compatibility
+This is deliberately simpler than GSD: no database, no parallel task graph, no daemon, and no background scheduler yet.
 
-The adapter targets the RPC contract documented in the current OMP repository. Before relying on it unattended, run `doctor` against the installed OMP version and run an opt-in live smoke test with your configured provider.
+## Current limitations
 
-This environment did not contain an authenticated live OMP installation, so the included adapter has been exercised against a protocol-shaped subprocess, not a paid live model call.
+This is the first vertical slice, not the full unattended-hours system yet. In particular:
 
-## Next reliability work
+- Captures are queued but not yet consumed by a replanner.
+- Pause is checked between controller steps, not during an active OMP turn.
+- There is no lock/concurrent-controller protection yet.
+- There is no slice-boundary reflection/replanning yet.
+- Crash reconciliation around a commit/state-write boundary still needs explicit hardening.
+- The real OMP adapter has been implemented against the current RPC docs but cannot be live-tested in this environment because OMP is not installed here.
 
-The next controller milestones should be:
+## Next implementation slice
 
-1. single-controller lock and stale-worker reconciliation,
-2. crash recovery around execute/verify/commit boundaries,
-3. safe consumption of pause/capture inbox messages,
-4. structured knowledge records,
-5. slice-boundary reflection and roadmap reassessment,
-6. persistent no-progress and runtime budgets,
-7. one dedicated run worktree/branch rather than working directly on the current tree.
+1. single-controller lock + inbox consumption;
+2. crash reconciliation using Git HEAD + attempt records;
+3. slice completion reflection and roadmap patch proposals;
+4. failure diagnosis/repair prompts with persistent retry budgets;
+5. failure-injection tests for worker death and controller restart.
