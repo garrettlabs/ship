@@ -1,0 +1,5 @@
+.ship/logs/
+.ship/lock
+.ship/worktree/
+node_modules/
+.DS_Store
