@@ -1,15 +1,16 @@
 import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { ShipState, Worker, WorkerResult } from "./types.ts";
+import type { ShipState, Worker, WorkerResult, WorkRequest } from "./types.ts";
 import { appendEvent, atomicJson, consumeInbox, loadConfig, loadState, readJson, saveState, shipDir, writeRoadmapView } from "./store.ts";
 import { candidateTree, clean, commitCandidate, ensureWorkspace, head, matchesCommit } from "./git.ts";
-import { executorPrompt, plannerPrompt, reviewPrompt } from "./prompts.ts";
+import { executorPrompt, plannerPrompt, reviewPrompt, workPlannerPrompt } from "./prompts.ts";
 import { applyReview, parsePlan, refresh, tasks } from "./model.ts";
+import { invalidateWorkProposals, parseWorkProposal } from "./work.ts";
 import { acquireLock } from "./lock.ts";
 import { assertNoProcess, runCheck } from "./process.ts";
 
-export type Step = "progress" | "task" | "complete" | "blocked" | "paused";
+export type Step = "progress" | "task" | "complete" | "blocked" | "paused" | "waiting";
 export interface ControllerOptions { signal?: AbortSignal; fault?: (at: "after_execute" | "after_verify" | "after_commit") => void; }
 export class Controller {
   private root: string; private worker: Worker; private options: ControllerOptions;
@@ -26,12 +27,12 @@ export class Controller {
         if (this.options.signal?.aborted) return "paused";
         const result = await this.advance(); onStep(result);
         if (result === "complete" || result === "blocked" || (once && result === "task")) return result;
-        if (result === "paused") { if (once) return result; await delay(250); }
+        if (result === "paused" || result === "waiting") { if (once) return result; await delay(250); }
       }
     } finally { await release(); }
   }
   private async persist(s: ShipState, type: string, detail: Record<string, unknown> = {}) {
-    refresh(s); await saveState(this.root, s); await writeRoadmapView(this.root, s);
+    refresh(s); invalidateWorkProposals(s); await saveState(this.root, s); await writeRoadmapView(this.root, s);
     await appendEvent(this.root, { type, ...detail });
   }
   private async block(s: ShipState, reason: string): Promise<Step> {
@@ -46,7 +47,14 @@ export class Controller {
   private async advance(): Promise<Step> {
     await assertNoProcess(this.root);
     const s = await loadState(this.root), config = await loadConfig(this.root);
-    await consumeInbox(this.root, s);
+    const revision = s.roadmapRevision;
+    const inboxChanged = await consumeInbox(this.root, s);
+    const invalidated = invalidateWorkProposals(s);
+    // Inbox additions/receipts and their generated views are visible even while
+    // paused. Applying an approval does not itself authorize resuming execution.
+    if (invalidated) await saveState(this.root, s);
+    if (inboxChanged || invalidated) await writeRoadmapView(this.root, s);
+    if (s.roadmapRevision !== revision) await appendEvent(this.root, { type: "work_applied", revision: s.roadmapRevision });
     if (s.paused || this.options.signal?.aborted) return "paused";
     if (s.phase === "blocked") return "blocked";
     await mkdir(path.join(shipDir(this.root), "logs"), { recursive: true });
@@ -82,6 +90,15 @@ export class Controller {
       s.roadmapRevision++; s.phase = "idle";
       await this.persist(s, "roadmap_created"); return "progress";
     }
+    // Freeze at a safe boundary while a proposal is being reviewed. Otherwise
+    // executing its intended parent could complete it and stale the proposal
+    // before the user has a chance to approve. Captures never create this gate.
+    if (s.workRequests!.some(r => r.status === "proposed")) {
+      if (s.phase !== "waiting") { s.phase = "waiting"; await this.persist(s, "work_awaiting_decision"); }
+      return "waiting";
+    }
+    const request = s.workRequests!.find(r => r.status === "queued" || r.status === "planning");
+    if (request) return this.planWork(s, cwd, project, request);
     refresh(s);
     for (const m of s.milestones) for (const slice of m.slices) {
       const key = `${m.id}/${slice.id}`;
@@ -114,7 +131,13 @@ export class Controller {
       await this.persist(s, "roadmap_reassessed", { slice: key, revision: s.roadmapRevision }); return "progress";
     }
     const next = tasks(s).find(x => x.t.status !== "passed");
-    if (!next) { s.phase = "complete"; await this.persist(s, "project_completed"); return "complete"; }
+    if (!next) {
+      if (s.workRequests!.some(r => r.status !== "applied" && r.status !== "rejected")) {
+        if (s.phase !== "waiting") { s.phase = "waiting"; await this.persist(s, "work_awaiting_decision"); }
+        return "waiting";
+      }
+      s.phase = "complete"; await this.persist(s, "project_completed"); return "complete";
+    }
     if ((s.dispatches ?? 0) >= config.limits.maxDispatches) return this.block(s, "Persistent dispatch budget exhausted");
     const { t, key, m, s: slice } = next;
     if (t.status === "running" || t.status === "verifying") return this.block(s, "Legacy interrupted task has no attempt record; manual reconciliation required");
@@ -143,6 +166,36 @@ export class Controller {
     await this.persist(s, "verification_started", { task: key });
     this.options.fault?.("after_execute");
     return this.verify(s, cwd);
+  }
+  private async planWork(s: ShipState, cwd: string, project: string, request: WorkRequest): Promise<Step> {
+    const config = await loadConfig(this.root);
+    if ((s.dispatches ?? 0) >= config.limits.maxDispatches) return this.block(s, "Persistent dispatch budget exhausted");
+    if (request.attempts >= config.limits.maxTaskAttempts) {
+      request.status = "failed"; request.error = `Work planning retry budget exhausted. ${request.error ?? ""}`;
+      s.phase = "idle"; await this.persist(s, "work_planning_failed", { request: request.id }); return "progress";
+    }
+    request.attempts++; request.status = "planning"; s.phase = "planning";
+    await this.persist(s, "work_planning_started", { request: request.id, attempt: request.attempts });
+    const baseline = await candidateTree(cwd), baseHead = await head(cwd);
+    const result = await this.invoke(s, workPlannerPrompt(project, s, request), cwd, `work-${request.id}-${request.attempts}`);
+    if (await head(cwd) !== baseHead || await candidateTree(cwd) !== baseline) {
+      request.status = "failed"; request.error = "Work planner modified source";
+      return this.block(s, "Work planner modified source; changes preserved for inspection");
+    }
+    await atomicJson(path.join(shipDir(this.root), "attempts", `work-${request.id}-${request.attempts}.json`), result);
+    try {
+      if (!result.ok) throw new Error(result.error ?? "Work planner failed");
+      const proposal = parseWorkProposal(s, request, result.text);
+      if ("conflict" in proposal) { request.status = "conflict"; request.error = proposal.conflict; }
+      else { request.status = "proposed"; request.proposal = proposal; delete request.error; }
+    } catch (error) {
+      request.error = String(error);
+      request.status = !result.ok && !result.retryable ? "failed" : "queued";
+    }
+    s.phase = "idle";
+    await this.persist(s, "work_proposal_updated", { request: request.id, status: request.status });
+    if (this.options.signal?.aborted) { s.paused = true; await saveState(this.root, s); return "paused"; }
+    return "progress";
   }
   private async failAttempt(s: ShipState, cwd: string, reason: string): Promise<Step> {
     const a = s.activeAttempt!, task = tasks(s).find(t => t.key === a.key)!.t;

@@ -12,6 +12,8 @@ Node.js 22.6+ and Git are required. Process supervision currently supports Linux
 npm test                 # offline tests, no install or credentials needed
 npm run demo             # complete a deterministic two-milestone example
 npm run demo -- --tui     # watch the same example in the terminal UI
+npm run demo -- --add     # propose/approve/execute an added milestone (simulated user)
+npm run demo -- --tui --add  # approve the example proposal yourself in the TUI
 ```
 
 The demo creates a disposable project under your system temporary directory, prints its path, and uses an explicitly fake RPC subprocess. It tests integration, not model quality. The files and Git history remain available for inspection.
@@ -53,8 +55,11 @@ Inspect the resulting branch before merging. Worktree creation requires an initi
 | `s` | Launch a detached controller; errors go to `.ship/logs/controller.log` |
 | `p` / `r` | Queue pause / resume at a safe boundary |
 | `c` | Capture a note; Enter submits, Escape cancels |
-| `1` / `2` / `3` | Roadmap / knowledge / activity |
-| Arrow keys | Scroll the selected view |
+| `a` | Describe new requested work; Enter queues it, Escape cancels |
+| `1` / `2` / `3` / `4` | Roadmap / knowledge / activity / work requests |
+| Up / down | Scroll the selected view; proposal commands wrap instead of truncating |
+| Left / right in view `4` | Select a work request |
+| `y` / `x` in view `4` | Approve / reject the selected request, then `y` confirms (Escape cancels) |
 | `q` or Ctrl+C | Detach the TUI without stopping the controller |
 
 The activity panel shows controller transitions and verification outcomes, not a full OMP conversation viewer. The UI reads persisted state and never runs the scheduling loop itself. Closing the UI cannot cancel its detached controller. Ctrl+C in a **foreground `ship run`**, by contrast, cancels that run and terminates its owned worker group.
@@ -71,11 +76,44 @@ ship status [--json]
 ship pause
 ship resume
 ship capture "<note>"
+ship add "<request>"
+ship proposals [W0001] [--json]
+ship approve W0001
+ship reject W0001
 ship recover
 ship doctor
 ```
 
 `init` and `doctor` make no model calls. `doctor` validates the state/configuration, Git baseline, platform, and worker executable. It does not prove authentication or RPC compatibility.
+
+## Add work in natural language
+
+`capture` means **information to consider**. `add` means **requested product work**. An addition is never silently treated as a lesson or automatically approved.
+
+```bash
+ship add "Add an alarm trap that attracts nearby zombies and can be triggered remotely."
+# If no controller is running:
+ship run --detach
+
+# From another terminal after the planner has produced a proposal:
+ship proposals
+ship proposals W0001       # classification, placement, goals, acceptance, exact commands
+ship approve W0001          # or: ship reject W0001
+```
+
+The controller assigns `W0001`-style request IDs when it consumes the inbox. It finishes the active task/reconciliation first, then starts a fresh OMP intake planner using the brief, current roadmap, existing approved additions, and knowledge. The planner chooses one **ADD_TASK**, **ADD_SLICE**, or **ADD_MILESTONE** patch and explains its placement. If no roadmap exists yet, the original brief is planned first. If the original project has already finished, the addition can create a follow-up milestone.
+
+**A proposed patch waits for explicit approval before any further task or slice review is dispatched.** This keeps the target from becoming completed history while you inspect it. `ship run` keeps polling the inbox without model calls; `--once` returns `waiting` rather than running unapproved work. Additions are planned one at a time, so the next request sees the latest approved revision. Captures do not introduce an approval gate.
+
+Commands are displayed as JSON-quoted strings so newlines and control characters remain visible. Review the proposed shell commands: approving a proposal authorizes those new checks to execute locally, alongside your protected project checks. The controller binds approval to the proposal's content fingerprint and roadmap revision, revalidates at the safe boundary, and saves the roadmap change, user provenance, application receipt, and processed inbox IDs together. Duplicate approvals and restarts cannot append the same work twice. Pausing still prevents execution even if an approval is applied.
+
+Only additive changes are supported. Existing acceptance checks, IDs, completed work, and the active attempt are not rewritten. Adding to a completed slice/milestone is rejected; use a new follow-up slice in an unfinished milestone or a new milestone instead. Optional `dependsOn` values are full task keys such as `M001/S01/T01`; prerequisites must appear earlier in the serial roadmap. Missing, forward, self, and cyclic dependencies are rejected—this is not a parallel dependency scheduler.
+
+Conflicts with explicit constraints are reported for a user decision rather than silently resolved. Conflict detection is model judgment, not a formal guarantee; inspect the proposal. A conflict or exhausted planning retry does not discard the request or rewrite the brief. It allows already-approved work to proceed, then shows `waiting` if unresolved requests remain. Reject that request and submit a clarified one. The same reject/resubmit workflow applies to stale proposals; Ship never silently rebases your approval.
+
+`add`, `proposals`, `approve`, and `reject` themselves make no model calls and never start a controller. A running controller consumes them at safe boundaries. If it exited, restart `ship run`; if paused, queue `ship resume`. Use `ship proposals --json` for the full request records. Request state persists under `workRequests` in `.ship/state.json`; planner outputs are saved in `.ship/attempts/work-W0001-1.json`. Existing 0.2 state loads with an empty request list—no database migration is needed. Do not run an older controller simultaneously against these files.
+
+In the TUI press `a` to add work, `4` to inspect requests, and left/right to choose a request. Read its checks with up/down, then press `y` to approve or `x` to reject and `y` to confirm. Closing the TUI does not stop the waiting controller.
 
 ## What this iteration implements
 
@@ -85,9 +123,10 @@ ship doctor
 - Controller-run acceptance commands with timeouts, exit codes, bounded output artifacts, and exact source-tree identity.
 - Frozen checks per attempt. Empty checks, missing executables, timeout, changed source during verification, or a worker merely claiming success are not accepted.
 - Commit intent before commit, followed by state finalization. Recovery recognizes a matching already-created task commit instead of creating another.
-- Persistent task/planning/review/dispatch limits and task failure evidence in subsequent repair prompts.
+- Persistent task/planning/review/intake/dispatch limits and task failure evidence in subsequent repair prompts.
 - User captures and attributed agent observations/lessons. Slice reviews can refine **unstarted task goals/implementation approaches** while preserving task IDs, acceptance commands, and completed history.
-- A detached TUI and reproducible offline demonstration.
+- User-requested task/slice/milestone additions with serial planning, exact-proposal approval, rejection, provenance, and stale/invalid patch protection.
+- A detached TUI and reproducible offline demonstrations.
 
 ## State and crash behavior
 
@@ -100,7 +139,7 @@ ship doctor
   KNOWLEDGE.md         generated, attributed knowledge view
   events.jsonl         audit only; never used to infer task completion
   attempts/            results, verification evidence, review proposals
-  inbox/               independently submitted pause/resume/capture messages
+  inbox/               independently submitted controls, captures, additions, decisions
   logs/                bounded worker/check logs; controller output
   lock/                controller ownership
   process.json         owned process-group record while active
@@ -143,6 +182,6 @@ It creates a temporary project and authorizes at most one real OMP execution dis
 
 ## Remaining MVP work
 
-This is still a small serial planner: it produces the initial task hierarchy eagerly. Full just-in-time slice expansion, structural roadmap edits (reordering/splitting/adding milestones), dependency graphs, user approval workflows, general diagnostic replanning, and cross-milestone knowledge retrieval are not implemented.
+This is still a small serial planner: it produces the initial task hierarchy eagerly. Full just-in-time slice expansion, general structural roadmap edits (reordering/splitting/replacing work), general dependency scheduling, automatic approval policies, general diagnostic replanning, and cross-milestone knowledge retrieval are not implemented.
 
 The next priority is a real OMP smoke run and bounded unattended trial, followed by broader planning/reassessment operations. Do not treat the offline tests as evidence that arbitrary overnight software development is reliable.
