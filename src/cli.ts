@@ -3,9 +3,9 @@ import { mkdir, readFile, writeFile, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { Controller } from "./controller.ts";
+import { Supervisor } from "./supervisor.ts";
 import { OmpRpcWorker } from "./rpc-worker.ts";
-import { atomicJson, configPath, exists, loadConfig, loadState, queueMessage, saveState, shipDir, statePath, writeRoadmapView } from "./store.ts";
+import { atomicJson, configPath, exists, loadConfig, loadState, queueMessage, queueRoadmapEdit, saveState, shipDir, statePath, writeRoadmapView } from "./store.ts";
 import { ensureGitRepo, ensureShipExcluded, git } from "./git.ts";
 import { recoverLock } from "./lock.ts";
 import { tui } from "./tui.ts";
@@ -46,7 +46,7 @@ export async function startDetached(root: string, args: string[] = []): Promise<
   } finally { await log.close(); }
 }
 function usage() {
-  console.log(`Ship 0.2 — file-backed autonomous controller\n\nship                         open the TUI\nship init --brief <file>      initialize without model calls\nship run [--once] [--detach] [--max-runtime 8h]\nship tui                     attach; q detaches without stopping the run\nship status [--json]\nship pause | resume          queue control at a safe boundary\nship capture "<note>"\nship recover                 unlock a confirmed-dead controller\nship doctor                  no paid model calls`);
+  console.log(`Ship 0.2 — file-backed autonomous controller\n\nship                         open the TUI\nship init --brief <file>      initialize without model calls\nship run [--once] [--detach] [--max-runtime 8h]\nship tui                     attach; q detaches without stopping the run\nship status [--json]\nship pause | resume          queue control at a safe boundary\nship capture "<note>"\nship add --slice M001/S01 --title TITLE --goal GOAL --acceptance TEXT --check COMMAND --revision N\nship change --task M001/S01/T01 --goal GOAL --revision N\nship recover                 unlock a confirmed-dead controller\nship doctor                  no paid model calls`);
 }
 export async function main(args: string[], root: string): Promise<void> {
   root = await realpath(root);
@@ -57,9 +57,32 @@ export async function main(args: string[], root: string): Promise<void> {
   if (command === "init") { const brief = value("--brief"); if (!brief) throw new Error("init requires --brief <file>"); await initialize(root, brief); console.log("Initialized .ship/. Commit the project baseline, then run ship doctor."); }
   else if (command === "status") {
     const s = await loadState(root);
-    console.log(args.includes("--json") ? JSON.stringify(s, null, 2) : `${s.projectName}: ${s.phase}${s.paused ? " (paused)" : ""}\nRoadmap r${s.roadmapRevision}; ${s.dispatches ?? 0} dispatches\nWorktree: ${s.workspace?.path ?? "not started"}\n${s.blockedReason ?? ""}`);
+    if (args.includes("--json") && args.includes("--compact")) {
+      console.log(JSON.stringify({
+        projectName: s.projectName, phase: s.phase, paused: s.paused, roadmapRevision: s.roadmapRevision,
+        dispatches: s.dispatches, current: s.current, blockedReason: s.blockedReason,
+        milestones: s.milestones.map(m => ({ id: m.id, slices: m.slices.map(slice => ({
+          id: slice.id, tasks: slice.tasks.map(task => ({ id: task.id, status: task.status, attempts: task.attempts })),
+        })) })),
+      }));
+    } else console.log(args.includes("--json") ? JSON.stringify(s, null, 2) : `${s.projectName}: ${s.phase}${s.paused ? " (paused)" : ""}\nRoadmap r${s.roadmapRevision}; ${s.dispatches ?? 0} dispatches\nWorktree: ${s.workspace?.path ?? "not started"}\n${s.blockedReason ?? ""}`);
   } else if (command === "pause" || command === "resume" || command === "capture") {
     await queueMessage(root, command, command === "capture" ? args.slice(1).join(" ") : undefined); console.log(`${command} queued.`);
+  } else if (command === "add" || command === "change") {
+    const flags = command === "add" ? ["--slice", "--title", "--goal", "--acceptance", "--check", "--revision"] : ["--task", "--goal", "--revision"];
+    const options = new Map<string, string>();
+    for (let i = 1; i < args.length; i += 2) {
+      const flag = args[i], content = args[i + 1];
+      if (!flags.includes(flag) || options.has(flag) || content === undefined || !content.trim()) throw new Error(`Invalid ${command} option: ${flag ?? "(missing)"}`);
+      options.set(flag, content);
+    }
+    for (const flag of flags) if (!options.has(flag)) throw new Error(`${command} requires ${flag}`);
+    const revisionText = options.get("--revision")!;
+    if (!/^(0|[1-9]\d*)$/.test(revisionText) || !Number.isSafeInteger(Number(revisionText))) throw new Error("Invalid roadmap revision");
+    const revision = Number(revisionText);
+    if (command === "add") await queueRoadmapEdit(root, { type: "add", slice: options.get("--slice")!, title: options.get("--title")!, goal: options.get("--goal")!, acceptance: options.get("--acceptance")!, check: options.get("--check")!, revision });
+    else await queueRoadmapEdit(root, { type: "change", task: options.get("--task")!, goal: options.get("--goal")!, revision });
+    console.log(`${command} queued for roadmap revision ${revision}; run the controller to apply it.`);
   } else if (command === "recover") { await recoverLock(root); console.log("Dead-controller lock cleared. Run ship run to reconcile persisted work."); }
   else if (command === "run") {
     for (let i = 1; i < args.length; i++) {
@@ -71,19 +94,19 @@ export async function main(args: string[], root: string): Promise<void> {
     if (args.includes("--detach")) { console.log(await startDetached(root, args.slice(1).filter(x => x !== "--detach"))); return; }
     const config = await loadConfig(root), abort = new AbortController();
     const stop = () => abort.abort(); process.once("SIGINT", stop); process.once("SIGTERM", stop);
-    const deadline = setTimeout(stop, duration);
+    const supervisor = new Supervisor(root, new OmpRpcWorker(config), { signal: abort.signal, maxRuntimeMs: duration });
     try {
-      const c = new Controller(root, new OmpRpcWorker(config), { signal: abort.signal });
       let last = "";
-      const result = await c.run(args.includes("--once"), step => { if (step !== "paused" || step !== last) console.log(`[ship] ${step}`); last = step; });
+      const result = await supervisor.run(args.includes("--once"), step => { if (step !== "paused" || step !== last) console.log(`[ship] ${step}`); last = step; });
       if (result === "blocked") process.exitCode = 2;
-    } finally { clearTimeout(deadline); process.off("SIGINT", stop); process.off("SIGTERM", stop); }
+    } finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }
   } else if (command === "doctor") {
     const checks: [string, boolean, string][] = [];
     try { await loadState(root); checks.push(["State schema", true, ""]); } catch (e) { checks.push(["State schema", false, String(e)]); }
     try { await git(root, ["rev-parse", "HEAD"]); await git(root, ["var", "GIT_AUTHOR_IDENT"]); checks.push(["Git baseline and author", true, ""]); } catch (e) { checks.push(["Git baseline and author", false, String(e)]); }
     try { const c = await loadConfig(root); const version = spawnSync(c.worker.command, ["--version"], { encoding: "utf8", timeout: 5000 }); checks.push(["Worker executable", version.status === 0, version.stdout?.trim() || version.error?.message || version.stderr?.trim()]); } catch (e) { checks.push(["Worker configuration", false, String(e)]); }
-    checks.push(["POSIX process groups", process.platform !== "win32", "Linux/macOS; use WSL2 on Windows"]);
+    const shell = spawnSync("sh", ["-c", "exit 0"], { encoding: "utf8", timeout: 5000, windowsHide: true });
+    checks.push(["Verification shell", shell.status === 0, shell.status === 0 ? "" : shell.error?.message || shell.stderr?.trim() || "Install a POSIX sh; Git for Windows includes one"]);
     for (const [name, ok, detail] of checks) console.log(`${ok ? "OK" : "FAIL"} ${name}${detail ? `: ${detail}` : ""}`);
     console.log("No live model call was made. Executable availability is not an OMP compatibility or authentication test.");
     if (checks.some(x => !x[1])) process.exitCode = 1;

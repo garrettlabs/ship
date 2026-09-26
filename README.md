@@ -4,9 +4,11 @@ A file-backed autonomous development controller using Oh My Pi (OMP) as a dispos
 
 The controller owns scheduling, verification, Git commits, recovery records, and operating limits. Fresh worker processes supply plans, code, and bounded review proposals. State is JSON; the roadmap and knowledge views are Markdown. There is no database or service dependency.
 
+`src/controller.ts` is the reusable state machine: construct `Controller(root, worker, options)` with any `Worker`, then call `step()` or `run()`. `src/supervisor.ts` owns cancellation and an optional runtime limit around that same controller; construct `Supervisor(root, worker, { signal, maxRuntimeMs })` to run or step without the CLI. The CLI supplies OMP worker configuration, terminal signals, progress output, and exit codes.
+
 ## Try the TUI without OMP or model calls
 
-Node.js 22.6+ and Git are required. Process supervision currently supports Linux/macOS; use WSL2 rather than native Windows. The implementation and terminal interaction have been exercised on Linux, not macOS.
+Node.js 22.6+ and Git are required. Process supervision supports Linux, macOS, and Windows. Native Windows uses Windows PowerShell (`powershell.exe`, included with Windows) to create a [kill-on-close Job Object](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) before starting each worker or check; verification commands still require a POSIX `sh` on `PATH` (Git for Windows includes one). Windows batch worker shims (`.cmd`/`.bat`, including `omp` resolved from `PATH`) accept ordinary literal arguments but reject shell metacharacters and environment expansion syntax rather than interpolate untrusted input. If a process record cannot be verified as terminated (including legacy Windows records without a job token), recovery refuses overlapping work and retains the record for manual inspection. The terminal interaction has been exercised on Linux.
 
 ```bash
 npm test                 # offline tests, no install or credentials needed
@@ -40,6 +42,19 @@ node --experimental-strip-types /path/to/ship/src/cli.ts tui
 
 Alternatively, `npm link` in the Ship repository installs the `ship` command. Then `ship` without arguments opens the TUI.
 
+## OMP interactive frontend
+
+Install dependencies with `npm ci`, then start OMP from an initialized Ship project (or a child directory) with the extension loaded explicitly:
+
+```bash
+omp -e /path/to/ship/extensions/ship.ts
+```
+
+`/ship` shows help; `/ship status` reads the supervisor's state through the standalone CLI. `/ship run` confirms before requesting a detached controller launch; paid model calls may follow. `/ship pause` and `/ship resume` queue safe-boundary controls. `/ship add` selects an existing slice and asks for a task title, goal, acceptance description, and executable verification command; `/ship change` updates only the goal of an unstarted, unattempted task. Both submit revision-checked roadmap edits to the supervisor inbox. They are **queued, not applied immediately**: the controller validates and applies them at its next safe boundary, or blocks with an explicit rejection reason if the revision or target has changed. While an attempt is active, edits wait until its reconciliation finishes. The extension does not run the controller internally or change `.ship/state.json` directly.
+
+The standalone `ship` CLI remains available. For noninteractive use, `ship add --slice M001/S01 --title TITLE --goal GOAL --acceptance TEXT --check COMMAND --revision N` and `ship change --task M001/S01/T01 --goal GOAL --revision N` submit the same requests; read the current revision with `ship status --json`. Only edits to unstarted work are allowed; existing task checks and acceptance criteria cannot be weakened through `change`. A `resume` request does not itself restart a stopped controller.
+
+
 `--once` includes necessary planning and bounded repairs, then stops after one accepted task. The default run continues through slice reviews and subsequent milestones until the approved plan is complete, blocked, paused, cancelled, or limited by its runtime/dispatch budget.
 
 The controller creates one branch such as `ship/run-1234abcd` and a worktree at `.ship/worktree`. It starts from the project's committed HEAD, not uncommitted files. It never stashes your work, pushes, deploys, merges into your branch, or changes your checkout. Dependencies and ignored build files are not copied into the new worktree.
@@ -71,6 +86,8 @@ ship status [--json]
 ship pause
 ship resume
 ship capture "<note>"
+ship add --slice M001/S01 --title TITLE --goal GOAL --acceptance TEXT --check COMMAND --revision N
+ship change --task M001/S01/T01 --goal GOAL --revision N
 ship recover
 ship doctor
 ```
@@ -88,6 +105,15 @@ ship doctor
 - Persistent task/planning/review/dispatch limits and task failure evidence in subsequent repair prompts.
 - User captures and attributed agent observations/lessons. Slice reviews can refine **unstarted task goals/implementation approaches** while preserving task IDs, acceptance commands, and completed history.
 - A detached TUI and reproducible offline demonstration.
+
+## Execution-plan task metadata
+
+Each task persists its objective (intended outcome), editable goal (implementation approach), preceding task dependencies, descriptive acceptance and verification requirements, controller-run verification commands, known affected domains/files, semantic task type, uncertainty, complexity, risk, parallel eligibility, execution route, and status. Supported semantic types include reconnaissance, planning/design, implementation, test, documentation, integration, review, and security review. The planner supplies scope and requirements; reusable SHIP core code derives classification. These fields do **not** spawn parallel workers or select a model/provider; execution remains serial and acceptance still depends on controller-run checks.
+
+Complexity is deterministic: multiple dependencies/domains, four or more affected files, high uncertainty, migration or integration mark a task `COMPLEX`; a focused known single-file documentation/test/configuration task with low uncertainty and no dependencies is `TRIVIAL`; other tasks are `STANDARD`. Risk is independent: explicit auth, secrets, destructive operations, migration/schema, persisted-data, filesystem-deletion, permissions or network/security signals in task scope or verification requirements produce `HIGH`; the migration task type itself is a risk signal. Absent signals with unknown uncertainty produce `UNKNOWN`, not an assertion of safety. Persisted rationale and signals explain the result. Neither classification nor agent descriptions replace acceptance evidence.
+
+Existing schema-v1 projects load safely: missing task metadata is derived in memory, without rewriting `.ship/state.json` on read; the next normal state save writes it atomically. Legacy status, attempt counts, roadmap revisions, frozen commands and recovery evidence are not reinterpreted. Unknown affected scope stays empty and uncertainty stays `UNKNOWN`.
+
 
 ## State and crash behavior
 
@@ -131,18 +157,18 @@ References inspected September 25, 2026:
 
 The default arguments include `--no-ui`; review your OMP settings/extensions before unattended execution. Project/global OMP configuration remains relevant, and unattended dialog defaults are not a security boundary.
 
-There was no installed/authenticated OMP in the implementation environment. **No real model session or hours-long live soak has been run.** The adapter is exercised with protocol-shaped subprocesses, including acknowledgement-only, malformed output, failed commands, cancellation, and unsettled sessions.
+OMP **18.3.2** completed a real RPC v1 execution smoke on native Windows on September 25, 2026. The run observed prompt acknowledgement, `prompt_result`, `session_settled`, final-answer retrieval, a controller-run acceptance check, and a committed source change. This is bounded compatibility evidence, not an hours-long live soak. Protocol-shaped subprocesses separately cover acknowledgement-only, malformed output, failed commands, cancellation, and unsettled sessions.
 
-An explicitly paid/live opt-in smoke test is provided:
+The explicitly paid/live opt-in smoke test is:
 
 ```bash
 SHIP_LIVE_OMP=1 npm run smoke
 ```
 
-It creates a temporary project and authorizes at most one real OMP execution dispatch. Ordinary tests never run it. Without the environment variable, the smoke script exits without starting a worker.
+On Windows Command Prompt, use `set SHIP_LIVE_OMP=1&& npm run smoke`. The script creates a temporary project and authorizes at most one real OMP execution dispatch. Ordinary tests never run it. Without the environment variable, it exits before starting a worker.
 
 ## Remaining MVP work
 
 This is still a small serial planner: it produces the initial task hierarchy eagerly. Full just-in-time slice expansion, structural roadmap edits (reordering/splitting/adding milestones), dependency graphs, user approval workflows, general diagnostic replanning, and cross-milestone knowledge retrieval are not implemented.
 
-The next priority is a real OMP smoke run and bounded unattended trial, followed by broader planning/reassessment operations. Do not treat the offline tests as evidence that arbitrary overnight software development is reliable.
+The next priority is a bounded unattended trial, followed by broader planning/reassessment operations. Do not treat one live smoke or the offline tests as evidence that arbitrary overnight software development is reliable.

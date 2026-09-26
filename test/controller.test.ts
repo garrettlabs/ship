@@ -2,8 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { main } from "../src/cli.ts";
 import { Controller } from "../src/controller.ts";
-import { atomicJson, configPath, exists, loadConfig, loadState, queueMessage, shipDir } from "../src/store.ts";
+import { atomicJson, configPath, exists, loadConfig, loadState, queueMessage, queueRoadmapEdit, shipDir } from "../src/store.ts";
 import { git } from "../src/git.ts";
 import { acquireLock } from "../src/lock.ts";
 import { fixture, plan, report, ScriptWorker, write } from "./helpers.ts";
@@ -137,4 +138,110 @@ test("corrupted verification evidence blocks commit recovery", async t => {
   const file = path.join(shipDir(root), "attempts/M001-S01-T01-a1.verification.json");
   const evidence = JSON.parse(await readFile(file, "utf8")); evidence.tree = "wrong"; await atomicJson(file, evidence);
   assert.equal(await new Controller(root, worker).step(), "blocked");
+});
+
+test("queued add applies at the controller boundary, creates a unique task, and reopens a completed roadmap", async t => {
+  const root = await fixture(t);
+  const worker = new ScriptWorker([{ ok: true, text: plan() }, write(), write("new-file.txt", "ready\n")]);
+  const controller = new Controller(root, worker);
+  assert.equal(await controller.run(), "complete");
+  const original = await loadState(root);
+  await main(["add", "--slice", "M001/S01", "--title", "Create second file", "--goal", "create new-file.txt", "--acceptance", "new-file.txt contains ready", "--check", "grep -q '^ready$' new-file.txt", "--revision", "1"], root);
+  assert.equal((await loadState(root)).roadmapRevision, 1);
+  assert.equal(await controller.run(), "complete");
+  const state = await loadState(root);
+  assert.equal(state.phase, "complete");
+  assert.equal(state.roadmapRevision, 2);
+  assert.deepEqual(state.milestones[0].slices[0].tasks.map(task => task.id), ["T01", "T02"]);
+  assert.equal(state.milestones[0].slices[0].tasks[1].status, "passed");
+  assert.deepEqual(state.milestones[0].slices[0].tasks[0].verificationCommands, original.milestones[0].slices[0].tasks[0].verificationCommands);
+  assert.equal(worker.calls.length, 3);
+  assert.equal(await controller.step(), "complete");
+  assert.equal((await loadState(root)).milestones[0].slices[0].tasks.length, 2);
+});
+
+test("queued change updates only an unattempted task goal and retains acceptance and checks", async t => {
+  const root = await fixture(t), controller = new Controller(root, new ScriptWorker([{ ok: true, text: plan(2) }, write()]));
+  await controller.step();
+  const before = (await loadState(root)).milestones[1].slices[0].tasks[0];
+  await main(["change", "--task", "M002/S01/T01", "--goal", "create improved file2.txt", "--revision", "1"], root);
+  assert.equal(await controller.step(), "task");
+  const state = await loadState(root), changed = state.milestones[1].slices[0].tasks[0];
+  assert.equal(changed.goal, "create improved file2.txt");
+  assert.deepEqual(changed.acceptance, before.acceptance);
+  assert.deepEqual(changed.verificationCommands, before.verificationCommands);
+  assert.equal(changed.attempts, 0);
+  assert.equal(state.roadmapRevision, 2);
+});
+
+test("stale queued edits block explicitly without changing the plan or replaying", async t => {
+  const root = await fixture(t), controller = new Controller(root, new ScriptWorker([{ ok: true, text: plan() }]));
+  await controller.step();
+  await queueRoadmapEdit(root, { type: "change", task: "M001/S01/T01", goal: "first edit", revision: 1 });
+  await queueRoadmapEdit(root, { type: "change", task: "M001/S01/T01", goal: "stale edit", revision: 1 });
+  assert.equal(await controller.step(), "blocked");
+  const blocked = await loadState(root);
+  assert.equal(blocked.roadmapRevision, 2);
+  assert.equal(blocked.milestones[0].slices[0].tasks[0].goal, "first edit");
+  assert.match(blocked.blockedReason!, /Rejected inbox\/.*Stale roadmap revision/);
+  assert.equal(blocked.processedInbox!.length, 2);
+  assert.equal(await controller.step(), "blocked");
+  assert.equal((await loadState(root)).processedInbox!.length, 2);
+});
+
+test("started tasks and forbidden fields fail closed without partially editing roadmap", async t => {
+  const root = await fixture(t), controller = new Controller(root, new ScriptWorker([{ ok: true, text: plan() }, write()]));
+  await controller.run();
+  const original = (await loadState(root)).milestones[0].slices[0].tasks[0];
+  await queueRoadmapEdit(root, { type: "change", task: "M001/S01/T01", goal: "replace finished result", revision: 1 });
+  assert.equal(await controller.step(), "blocked");
+  let state = await loadState(root);
+  assert.match(state.blockedReason!, /already started/);
+  assert.deepEqual(state.milestones[0].slices[0].tasks[0], original);
+  await queueMessage(root, "resume");
+  const file = path.join(shipDir(root), "inbox", "zz-forbidden.json");
+  await atomicJson(file, { type: "change", task: "M001/S01/T01", goal: "edit", acceptance: ["weakened"], revision: 1 });
+  assert.equal(await controller.step(), "blocked");
+  state = await loadState(root);
+  assert.match(state.blockedReason!, /forbidden fields/);
+  assert.deepEqual(state.milestones[0].slices[0].tasks[0], original);
+});
+
+test("roadmap edits wait for attempt reconciliation while pause remains independent", async t => {
+  const root = await fixture(t), worker = new ScriptWorker([{ ok: true, text: plan(2) }, write()]);
+  const interrupted = new Controller(root, worker, { fault(at) { if (at === "after_execute") throw new Error("interrupted"); } });
+  await interrupted.step();
+  await assert.rejects(interrupted.step(), /interrupted/);
+  await queueRoadmapEdit(root, { type: "change", task: "M002/S01/T01", goal: "revised after commit", revision: 1 });
+  await queueMessage(root, "pause");
+  const recovering = new Controller(root, worker);
+  assert.equal(await recovering.step(), "paused");
+  let state = await loadState(root);
+  assert.equal(state.roadmapRevision, 1);
+  assert.equal(state.processedInbox!.length, 1);
+  assert.equal(state.milestones[1].slices[0].tasks[0].goal, "create file2.txt");
+  await queueMessage(root, "resume");
+  assert.equal(await recovering.step(), "task");
+  state = await loadState(root);
+  assert.equal(state.roadmapRevision, 1);
+  assert.equal(state.activeAttempt, undefined);
+  await queueMessage(root, "pause");
+  assert.equal(await recovering.step(), "paused");
+  state = await loadState(root);
+  assert.equal(state.roadmapRevision, 2);
+  assert.equal(state.milestones[1].slices[0].tasks[0].goal, "revised after commit");
+});
+
+test("adding above the 200-task plan cap is rejected without a partial revision", async t => {
+  const root = await fixture(t);
+  const full = JSON.parse(plan());
+  full.milestones[0].slices[0].tasks = Array.from({ length: 200 }, (_, i) => ({ ...full.milestones[0].slices[0].tasks[0], id: `T${String(i + 1).padStart(2, "0")}` }));
+  const controller = new Controller(root, new ScriptWorker([{ ok: true, text: JSON.stringify(full) }]));
+  await controller.step();
+  await queueRoadmapEdit(root, { type: "add", slice: "M001/S01", title: "Overflow", goal: "must not appear", acceptance: "checked", check: "true", revision: 1 });
+  assert.equal(await controller.step(), "blocked");
+  const state = await loadState(root);
+  assert.equal(state.milestones[0].slices[0].tasks.length, 200);
+  assert.equal(state.roadmapRevision, 1);
+  assert.match(state.blockedReason!, /200 tasks/);
 });
