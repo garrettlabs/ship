@@ -11,9 +11,16 @@ export function alive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid === 0) return true;
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
-async function treeRunning(pid: number): Promise<boolean> {
+const jobHelper = fileURLToPath(new URL("./process-job.ps1", import.meta.url));
+async function treeRunning(pid: number, token?: string): Promise<boolean> {
   if (!Number.isInteger(pid) || pid <= 0) return true;
-  if (process.platform === "win32") return alive(pid);
+  if (process.platform === "win32") {
+    if (!token || alive(pid)) return true;
+    const { promise, resolve } = Promise.withResolvers<boolean>();
+    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", jobHelper, "probe", token],
+      { windowsHide: true, timeout: 10_000 }, (error, stdout) => resolve(!!error || stdout.trim() !== "ABSENT"));
+    return promise;
+  }
   if (!alive(-pid)) return false;
   // Orphaned zombies can retain a group ID but cannot write or spawn work.
   const { promise, resolve } = Promise.withResolvers<boolean>();
@@ -26,20 +33,14 @@ async function treeRunning(pid: number): Promise<boolean> {
   });
   return promise;
 }
-async function killTree(pid: number, signal: NodeJS.Signals): Promise<void> {
-  if (process.platform !== "win32") {
-    try { process.kill(-pid, signal); } catch {}
-    return;
-  }
-  const { promise, resolve } = Promise.withResolvers<void>();
-  execFile("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, timeout: 5000 }, () => resolve());
-  await promise;
+function killGroup(pid: number, signal: NodeJS.Signals): void {
+  try { process.kill(-pid, signal); } catch {}
 }
 export async function assertNoProcess(root: string): Promise<void> {
   const file = path.join(shipDir(root), "process.json");
   if (!await exists(file)) return;
-  const record = await readJson<{ pid: number; host: string }>(file);
-  if (record.host !== hostname() || await treeRunning(record.pid)) throw new Error(`Worker group ${record.pid} may still be alive. Refusing overlapping work; inspect it before recovery.`);
+  const record = await readJson<{ pid: number; host: string; token?: string }>(file);
+  if (record.host !== hostname() || await treeRunning(record.pid, record.token)) throw new Error(`Worker group ${record.pid} may still be alive. Refusing overlapping work; inspect it before recovery.`);
   await unlink(file);
 }
 export async function startProcess(command: string, args: string[], cwd: string, root?: string) {
@@ -59,21 +60,24 @@ export async function startProcess(command: string, args: string[], cwd: string,
   const marker = root && path.join(shipDir(root), "process.json");
   try {
     if (marker) await atomicJson(marker, { pid, token, host: hostname(), command, at: new Date().toISOString() });
-  } catch (error) { await killTree(pid, "SIGKILL"); await closed; throw error; }
+  } catch (error) { if (process.platform === "win32") child.kill("SIGKILL"); else killGroup(pid, "SIGKILL"); await closed; throw error; }
   let sent = false;
   return {
     child, closed,
     // Install output/error handlers before opening the execution gate.
-    start() { if (!sent) { sent = true; child.send({ type: "start", command, args }, () => {}); } },
+    start() { if (!sent) { sent = true; child.send({ type: "start", command, args, token }, () => {}); } },
     async stop(): Promise<void> {
       child.stdin.end();
       if (!exited) await Promise.race([closed, delay(300)]);
-      if (!exited) { await killTree(pid, "SIGTERM"); await Promise.race([closed, delay(300)]); }
-      // Also reap ordinary descendants if their parent exited early.
-      if (await treeRunning(pid)) await killTree(pid, "SIGKILL");
+      if (!exited) {
+        if (process.platform === "win32") child.kill("SIGKILL");
+        else killGroup(pid, "SIGTERM");
+        await Promise.race([closed, delay(300)]);
+      }
+      if (process.platform !== "win32" && await treeRunning(pid)) killGroup(pid, "SIGKILL");
       if (!exited) await Promise.race([closed, delay(1500)]);
-      for (let i = 0; i < 20 && await treeRunning(pid); i++) await delay(25);
-      if (!exited || await treeRunning(pid)) throw new Error(`Cannot establish termination of worker group ${pid}; process record retained`);
+      for (let i = 0; i < 40 && await treeRunning(pid, token); i++) await delay(50);
+      if (!exited || await treeRunning(pid, token)) throw new Error(`Cannot establish termination of worker group ${pid}; process record retained`);
       if (marker && await exists(marker)) {
         const record = await readJson<{ token: string }>(marker);
         if (record.token === token) await unlink(marker);

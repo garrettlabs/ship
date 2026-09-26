@@ -8,7 +8,7 @@ The controller owns scheduling, verification, Git commits, recovery records, and
 
 ## Try the TUI without OMP or model calls
 
-Node.js 22.6+ and Git are required. Process supervision supports Linux, macOS, and Windows. Native Windows also requires a POSIX `sh` on `PATH`; Git for Windows includes one. The terminal interaction has been exercised on Linux.
+Node.js 22.6+ and Git are required. Process supervision supports Linux, macOS, and Windows. Native Windows uses Windows PowerShell (`powershell.exe`, included with Windows) to create a [kill-on-close Job Object](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) before starting each worker or check; verification commands still require a POSIX `sh` on `PATH` (Git for Windows includes one). Windows batch worker shims (`.cmd`/`.bat`, including `omp` resolved from `PATH`) accept ordinary literal arguments but reject shell metacharacters and environment expansion syntax rather than interpolate untrusted input. If a process record cannot be verified as terminated (including legacy Windows records without a job token), recovery refuses overlapping work and retains the record for manual inspection. The terminal interaction has been exercised on Linux.
 
 ```bash
 npm test                 # offline tests, no install or credentials needed
