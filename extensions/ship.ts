@@ -1,15 +1,9 @@
-import { spawn } from "node:child_process";
 import { access, realpath } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
-
-const cli = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
-const MAX_OUTPUT = 256 * 1024;
-const TIMEOUT_MS = 15_000;
-
-type CliResult = { stdout: string; stderr: string };
-export type ShipCliRunner = (root: string, args: string[]) => Promise<CliResult>;
+import { loadState, queueMessage, queueRoadmapEdit } from "../src/store.ts";
+import { reportNativeOutcome, routeNativeSpawn, startNativeRun, submitNativePlan, type NativeOutcome } from "../src/native-execution.ts";
+import type { RoadmapEdit } from "../src/types.ts";
 
 async function projectRoot(cwd: string): Promise<string> {
   let current = await realpath(cwd);
@@ -25,58 +19,72 @@ async function projectRoot(cwd: string): Promise<string> {
   }
 }
 
-export const runShipCli: ShipCliRunner = (root, args) => {
-  const { promise, resolve, reject } = Promise.withResolvers<CliResult>();
-  const child = spawn("node", ["--no-warnings", "--experimental-strip-types", cli, ...args], {
-    cwd: root, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stdout = "", stderr = "", bytes = 0;
-  let settled = false;
-  const finish = (error?: Error) => {
-    if (settled) return;
-    settled = true;
-    clearTimeout(timer);
-    if (error) reject(error);
-    else resolve({ stdout: stdout.trim(), stderr: stderr.trim() });
-  };
-  const append = (chunk: Buffer, stream: "stdout" | "stderr") => {
-    bytes += chunk.length;
-    if (bytes > MAX_OUTPUT) { child.kill(); finish(new Error("Ship CLI output exceeded 256 KiB")); return; }
-    if (stream === "stdout") stdout += chunk.toString("utf8");
-    else stderr += chunk.toString("utf8");
-  };
-  child.stdout.on("data", chunk => append(chunk, "stdout"));
-  child.stderr.on("data", chunk => append(chunk, "stderr"));
-  child.once("error", error => finish(error));
-  child.once("close", code => finish(code === 0 ? undefined : new Error(stderr.trim() || stdout.trim() || `Ship CLI exited with code ${code}`)));
-  const timer = setTimeout(() => { child.kill(); finish(new Error(`Ship CLI timed out after ${TIMEOUT_MS / 1000}s`)); }, TIMEOUT_MS);
-  return promise;
-};
 
-type RoadmapTask = { id: string; title: string; status: string; attempts: number };
-type RoadmapSlice = { id: string; title: string; tasks: RoadmapTask[] };
-type RoadmapMilestone = { id: string; slices: RoadmapSlice[] };
-type Status = {
-  projectName: string; phase: string; paused: boolean; roadmapRevision: number;
-  milestones: RoadmapMilestone[]; dispatches?: number; blockedReason?: string;
-  current?: { milestoneId: string; sliceId: string; taskId?: string };
-};
-
-function parseStatus(json: string): Status {
-  const state: unknown = JSON.parse(json);
-  if (!state || typeof state !== "object") throw new Error("Ship status is not an object");
-  const s = state as Status;
-  if (typeof s.projectName !== "string" || typeof s.phase !== "string" || typeof s.paused !== "boolean" ||
-      !Number.isSafeInteger(s.roadmapRevision) || s.roadmapRevision < 0 || !Array.isArray(s.milestones)) {
-    throw new Error("Ship status has an invalid state or roadmap revision");
-  }
-  return s;
+function isNativeOutcome(value: unknown): value is NativeOutcome {
+  if (value === null || typeof value !== "object") return false;
+  if (!("batchId" in value && "assignmentId" in value && "status" in value && "summary" in value)) return false;
+  return typeof value.batchId === "string" && typeof value.assignmentId === "string" &&
+    (value.status === "passed" || value.status === "failed" || value.status === "partial") &&
+    typeof value.summary === "string";
 }
 
-const help = "Ship commands: /ship status (project and roadmap); /ship run (confirm and launch detached controller); /ship pause and /ship resume (queue controls); /ship add (queue a fully planned task in a slice); /ship change (queue an unstarted task goal and planning-hint change). Queued requests take effect only at a controller safe boundary.";
+const help = "Ship commands: /ship status (project and roadmap); /ship run (dispatch native OMP tasks); /ship pause and /ship resume (queue safe-boundary controls); /ship add (queue a fully planned task); /ship change (queue an unstarted goal and planning hints). Queued requests take effect only at a safe boundary.";
 
-export function createShipExtension(execute: ShipCliRunner = runShipCli) {
+export function createShipExtension() {
   return (api: ExtensionAPI): void => {
+    const z = api.zod;
+    api.on("before_subagent_spawn", async (event, ctx) => {
+      if (ctx.agent.kind !== "main" || !event.spawnKey?.includes("Ship")) return;
+      const root = await projectRoot(ctx.cwd).catch(() => undefined);
+      if (!root) return;
+      try {
+        const alias = await routeNativeSpawn(root, ctx.sessionManager.getSessionId(), event.spawnKey, event.agent, role => Boolean(ctx.models.resolve(role)));
+        if (alias) return { model: alias, note: `SHIP assignment routed by configured OMP ${alias} role` };
+      } catch (error) {
+        return { block: true, reason: error instanceof Error ? error.message : String(error) };
+      }
+    });
+    api.registerTool({
+      name: "ship_plan",
+      label: "Ship execution plan",
+      description: "Submit a complete SHIP plan from the assigned OMP-native planner for validation and task scheduling.",
+      parameters: z.object({ planningId: z.string(), plan: z.string() }),
+      async execute(_id, params, _signal, _update, ctx) {
+        try {
+          if (ctx.agent.kind !== "main") throw new Error("Only the main OMP session can submit SHIP plans");
+          if (!params || typeof params !== "object" || !("planningId" in params) || typeof params.planningId !== "string" ||
+              !("plan" in params) || typeof params.plan !== "string") throw new Error("Invalid SHIP plan fields");
+          const root = await projectRoot(ctx.cwd);
+          const next = await submitNativePlan(root, ctx.sessionManager.getSessionId(), params.planningId, params.plan);
+          if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
+          return { content: [{ type: "text", text: next }] };
+        } catch (error) {
+          return { content: [{ type: "text", text: `SHIP plan rejected: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+        }
+      },
+    });
+    api.registerTool({
+      name: "ship_outcome",
+      label: "Ship task outcome",
+      description: "Record the concrete result of a SHIP OMP-native assignment. The SHIP state machine verifies successful work before marking it passed.",
+      parameters: z.object({
+        batchId: z.string(), assignmentId: z.string(),
+        status: z.enum(["passed", "failed", "partial"]),
+        summary: z.string(),
+      }),
+      async execute(_id, params, _signal, _update, ctx) {
+        try {
+          if (!isNativeOutcome(params)) throw new Error("Invalid SHIP outcome fields");
+          if (ctx.agent.kind !== "main") throw new Error("Only the main OMP session can report SHIP assignments");
+          const root = await projectRoot(ctx.cwd);
+          const next = await reportNativeOutcome(root, ctx.sessionManager.getSessionId(), params);
+          if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
+          return { content: [{ type: "text", text: next }] };
+        } catch (error) {
+          return { content: [{ type: "text", text: `SHIP outcome rejected: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+        }
+      },
+    });
     api.registerCommand("ship", {
       description: "Inspect and control the Ship project (/ship for help)",
       async handler(args: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -90,26 +98,26 @@ export function createShipExtension(execute: ShipCliRunner = runShipCli) {
         }
         try {
           const root = await projectRoot(ctx.cwd);
-          const call = (argv: string[]) => execute(root, argv);
-          const status = async () => parseStatus((await call(["status", "--json", "--compact"])).stdout);
           if (action === "status") {
-            const s = await status();
+            const s = await loadState(root);
             const taskCount = s.milestones.reduce((count, milestone) => count + milestone.slices.reduce((n, slice) => n + slice.tasks.length, 0), 0);
-            ctx.ui.notify(`${s.projectName}: ${s.phase}${s.paused ? " (paused)" : ""}; roadmap r${s.roadmapRevision}, ${taskCount} tasks, ${s.dispatches ?? 0} dispatches${s.current ? `; current ${s.current.milestoneId}/${s.current.sliceId}${s.current.taskId ? `/${s.current.taskId}` : ""}` : ""}${s.blockedReason ? `; blocked: ${s.blockedReason}` : ""}`, s.phase === "blocked" ? "warning" : "info");
+            ctx.ui.notify(`${s.projectName}: ${s.phase}${s.paused ? " (paused)" : ""}; roadmap r${s.roadmapRevision}, ${taskCount} tasks, ${s.dispatches ?? 0} dispatches${s.nativeBatch ? `; native batch ${s.nativeBatch.id} (${s.nativeBatch.stage})` : ""}${s.blockedReason ? `; blocked: ${s.blockedReason}` : ""}`, s.phase === "blocked" ? "warning" : "info");
             return;
           }
           if (action === "run") {
-            if (!await ctx.ui.confirm("Start Ship controller?", "Launch Ship in the background? Its workers may use paid model calls.")) return;
-            const result = await call(["run", "--detach"]);
-            ctx.ui.notify(result.stdout || "Ship controller launch requested; check .ship/logs/controller.log for startup errors.", "info");
+            if (ctx.agent.kind !== "main") throw new Error("Run SHIP from the main OMP session");
+            if (!await ctx.ui.confirm("Start Ship in this OMP session?", "Dispatch ready tasks using OMP task agents? Model calls may be paid.")) return;
+            const next = await startNativeRun(root, ctx.sessionManager.getSessionId());
+            if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
+            ctx.ui.notify(next.startsWith("SHIP OMP-native") ? "SHIP native planning/task assignment sent to this OMP session." : next, next.startsWith("SHIP blocked") ? "warning" : "info");
             return;
           }
           if (action === "pause" || action === "resume") {
-            await call([action]);
-            ctx.ui.notify(`Ship ${action} queued; it will take effect at a controller safe boundary.`, "info");
+            await queueMessage(root, action);
+            ctx.ui.notify(`Ship ${action} queued; it will take effect at a safe boundary.`, "info");
             return;
           }
-          const s = await status();
+          const s = await loadState(root);
           const slices = s.milestones.flatMap(m => m.slices.map(slice => ({ label: `${m.id}/${slice.id}`, slice })));
           const tasks = slices.flatMap(({ label, slice }) => slice.tasks.filter(task => task.status === "pending" && task.attempts === 0).map(task => `${label}/${task.id}`));
           const options = action === "add" ? slices.map(x => x.label) : tasks;
@@ -127,7 +135,7 @@ export function createShipExtension(execute: ShipCliRunner = runShipCli) {
             if (!input.trim()) { ctx.ui.notify(`Task ${field} cannot be empty.`, "error"); return; }
             values.push(input.trim());
           }
-          const hints: string[] = [];
+          const hints: Partial<RoadmapEdit> = {};
           for (const [label, flag, placeholder] of [
             ["semantic type", "--type", "Optional: implementation, documentation, migration, ..."],
             ["uncertainty", "--uncertainty", "Optional: LOW, MEDIUM, HIGH, UNKNOWN"],
@@ -138,14 +146,20 @@ export function createShipExtension(execute: ShipCliRunner = runShipCli) {
           ]) {
             const input = await ctx.ui.input(`Task ${label}`, placeholder);
             if (input === undefined) return;
-            if (input.trim()) hints.push(flag, input.trim());
+            if (input.trim()) {
+              const value = input.trim();
+              if (flag === "--type") Object.assign(hints, { taskType: value });
+              else if (flag === "--uncertainty") Object.assign(hints, { uncertainty: value });
+              else if (flag === "--verify") Object.assign(hints, { verificationRequirements: [value] });
+              else Object.assign(hints, { [flag === "--depends" ? "dependencies" : flag === "--files" ? "affectedFiles" : "affectedDomains"]: value === "-" ? [] : value.split(",").map(part => part.trim()) });
+            }
           }
           if (!await ctx.ui.confirm(`${action === "add" ? "Queue new task" : "Queue goal change"} for ${id}?`, `Roadmap r${s.roadmapRevision}. This request will be applied at a controller safe boundary only if the revision is still current.`)) return;
-          const argv = action === "add"
-            ? ["add", "--slice", id, "--title", values[0], "--goal", values[1], "--acceptance", values[2], "--check", values[3], "--revision", String(s.roadmapRevision), ...hints]
-            : ["change", "--task", id, "--goal", values[0], "--revision", String(s.roadmapRevision), ...hints];
-          await call(argv);
-          ctx.ui.notify(`Ship ${action} request queued for ${id} at roadmap r${s.roadmapRevision}; not applied yet. The controller will validate it at a safe boundary.`, "info");
+          const edit = action === "add"
+            ? { type: "add", slice: id, title: values[0], goal: values[1], acceptance: values[2], check: values[3], revision: s.roadmapRevision, ...hints }
+            : { type: "change", task: id, goal: values[0], revision: s.roadmapRevision, ...hints };
+          await queueRoadmapEdit(root, edit as RoadmapEdit);
+          ctx.ui.notify(`Ship ${action} request queued for ${id} at roadmap r${s.roadmapRevision}; not applied yet. SHIP will validate it at a safe boundary.`, "info");
         } catch (error) {
           ctx.ui.notify(`Ship ${action} failed: ${error instanceof Error ? error.message : String(error)}`, "error");
         }

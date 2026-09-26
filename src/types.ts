@@ -51,6 +51,13 @@ export type InboxMessage =
   | { id: string; type: "pause" | "resume"; at: string }
   | { id: string; type: "capture"; note: string; at: string }
   | (RoadmapEdit & { id: string; at: string });
+export interface NativeAssignment {
+  id: string; key: string; status: "pending" | "passed" | "failed" | "partial"; summary?: string; routed?: boolean;
+}
+export interface NativeBatch {
+  id: string; sessionId: string; revision: number; stage: "executing" | "reviewing"; assignments: NativeAssignment[]; settling?: boolean; awaitingBudget?: boolean;
+}
+export interface NativePlanning { id: string; sessionId: string; attempts: number; }
 export interface ShipState {
   schemaVersion: 1; projectName: string; phase: RunPhase; roadmapRevision: number;
   milestones: Milestone[]; current?: { milestoneId: string; sliceId: string; taskId?: string };
@@ -58,6 +65,8 @@ export interface ShipState {
   paused: boolean; blockedReason?: string; lastProgressAt: string; createdAt: string; updatedAt: string;
   workspace?: { path: string; branch: string; baseHead: string };
   lastHead?: string; partialTree?: string; activeAttempt?: Attempt; dispatches?: number; planningFailures?: number;
+  nativeBatch?: NativeBatch;
+  nativePlanning?: NativePlanning;
   reviewedSlices?: string[]; reviewAttempts?: Record<string, number>;
   knowledge?: Knowledge[]; processedInbox?: string[];
 }
