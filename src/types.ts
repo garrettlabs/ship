@@ -4,12 +4,22 @@ export type TaskType = "reconnaissance" | "planning-design" | "implementation" |
 export type TaskComplexity = "TRIVIAL" | "STANDARD" | "COMPLEX";
 export type TaskRisk = "LOW" | "HIGH" | "UNKNOWN";
 export type TaskUncertainty = "LOW" | "MEDIUM" | "HIGH" | "UNKNOWN";
+export type ExecutionRole = "main" | "smol" | "task" | "plan" | "slow";
+export type SpecialistIntent = "scout" | "reviewer" | "security-reviewer";
+export interface TaskExecution {
+  mode: "main" | "delegate";
+  role: ExecutionRole;
+  reason: string;
+  specialist?: SpecialistIntent;
+  verificationSpecialist?: "security-reviewer";
+}
 export interface Task {
   id: string; title: string; objective: string; goal: string; dependencies: string[];
   acceptance: string[]; affectedDomains: string[]; affectedFiles: string[];
   taskType: TaskType; complexity: TaskComplexity; risk: TaskRisk; uncertainty: TaskUncertainty;
   classificationSignals: string[]; classificationRationale: string[];
   parallelEligible: boolean; executionRoute: "direct" | "investigate" | "decompose";
+  execution: TaskExecution;
   verificationRequirements: string[]; verificationCommands: string[];
   status: TaskStatus; attempts: number; lastError?: string;
 }
