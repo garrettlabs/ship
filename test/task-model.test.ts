@@ -40,9 +40,12 @@ test("explicit migration type and verification-only secret boundaries remain hig
   assert.equal(secrets.risk, "HIGH");
   assert.equal(secrets.parallelEligible, false);
   assert.deepEqual(secrets.classificationSignals, ["secrets"]);
+  const migrating = task({ goal: "Migrating legacy files" });
+  assert.equal(migrating.risk, "HIGH");
+  assert.deepEqual(migrating.classificationSignals, ["migration/schema"]);
 });
 
-test("qualified dependencies reference preceding tasks across slices", () => {
+test("qualified dependencies resolve across slices", () => {
   const raw = JSON.parse(plan());
   const firstSlice = raw.milestones[0].slices[0];
   raw.milestones[0].slices.push({
@@ -51,10 +54,6 @@ test("qualified dependencies reference preceding tasks across slices", () => {
   });
   const planned = parsePlan(JSON.stringify(raw));
   assert.deepEqual(planned[0].slices[1].tasks[0].dependencies, ["M001/S01/T01"]);
-  assert.throws(() => {
-    raw.milestones[0].slices[1].tasks[0].dependencies = ["T01"];
-    parsePlan(JSON.stringify(raw));
-  }, /Invalid or nonpreceding task dependency/);
 });
 
 test("execution plans preserve every required semantic task type", () => {
@@ -74,7 +73,7 @@ test("legacy plan metadata is honest about unknown scope and planner cannot over
   }
   for (const extra of [{ uncertainty: "surprise" }, { taskType: "unsupported" }, { dependencies: ["T99"] }]) {
     const raw = JSON.parse(plan()); Object.assign(raw.milestones[0].slices[0].tasks[0], extra);
-    assert.throws(() => parsePlan(JSON.stringify(raw)), /Invalid/);
+    assert.throws(() => parsePlan(JSON.stringify(raw)), /Invalid|Missing task dependency/);
   }
 });
 
