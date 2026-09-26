@@ -1,12 +1,13 @@
-export type TaskStatus = "pending" | "running" | "verifying" | "passed" | "failed" | "blocked";
+export type TaskStatus = "pending" | "running" | "verifying" | "passed" | "failed" | "blocked" | "cancelled";
 export type RunPhase = "idle" | "planning" | "executing" | "verifying" | "reviewing" | "waiting" | "blocked" | "complete";
+export interface Cancellation { reason: string; origin: WorkOrigin; }
 export interface Task {
   id: string; title: string; goal: string; acceptance: string[];
-  verificationCommands: string[]; dependsOn?: string[]; requestedBy?: WorkOrigin; status: TaskStatus; attempts: number; lastError?: string;
+  verificationCommands: string[]; dependsOn?: string[]; requestedBy?: WorkOrigin; status: TaskStatus; attempts: number; lastError?: string; changedBy?: WorkOrigin[]; cancellation?: Cancellation;
 }
-export interface Slice { id: string; title: string; status: "pending" | "active" | "complete"; tasks: Task[]; requestedBy?: WorkOrigin; }
+export interface Slice { id: string; title: string; status: "pending" | "active" | "complete" | "cancelled"; tasks: Task[]; requestedBy?: WorkOrigin; changedBy?: WorkOrigin[]; cancellation?: Cancellation; }
 export interface Milestone {
-  id: string; title: string; outcome: string; status: "pending" | "active" | "complete"; slices: Slice[]; requestedBy?: WorkOrigin;
+  id: string; title: string; outcome: string; status: "pending" | "active" | "complete" | "cancelled"; slices: Slice[]; requestedBy?: WorkOrigin; changedBy?: WorkOrigin[]; cancellation?: Cancellation;
 }
 export interface Knowledge {
   id: string; kind: "capture" | "observation" | "decision" | "assumption" | "lesson";
@@ -17,13 +18,14 @@ export interface Attempt {
   commands: string[]; revision: number; summary?: string; tree?: string;
 }
 export interface ShipState {
-  schemaVersion: 1; projectName: string; phase: RunPhase; roadmapRevision: number;
+  schemaVersion: 1 | 2; projectName: string; phase: RunPhase; roadmapRevision: number;
   milestones: Milestone[]; current?: { milestoneId: string; sliceId: string; taskId?: string };
   paused: boolean; blockedReason?: string; lastProgressAt: string; createdAt: string; updatedAt: string;
   workspace?: { path: string; branch: string; baseHead: string };
   lastHead?: string; partialTree?: string; activeAttempt?: Attempt; dispatches?: number; planningFailures?: number;
   reviewedSlices?: string[]; reviewAttempts?: Record<string, number>;
   knowledge?: Knowledge[]; processedInbox?: string[]; workRequests?: WorkRequest[];
+  requirements?: RequirementAmendment[]; requirementsBaseHash?: string;
 }
 export interface ShipConfig {
   schemaVersion: 1;
@@ -55,14 +57,31 @@ export type Addition =
 export interface AdditionProposal {
   revision: number; requestId: string; rationale: string; patch: Addition;
 }
-export interface WorkProposal extends AdditionProposal { id: string; }
+export type TaskEdits = Partial<Pick<NewTask, "title" | "goal" | "acceptance" | "verificationCommands" | "dependsOn">>;
+export type ChangeOperation = Addition
+  | { type: "MODIFY_TASK"; target: string; updates: TaskEdits; reason: string }
+  | { type: "MODIFY_SLICE"; target: string; updates: { title: string }; reason: string }
+  | { type: "MODIFY_MILESTONE"; target: string; updates: { title?: string; outcome?: string }; reason: string }
+  | { type: "MOVE_TASK" | "MOVE_SLICE" | "MOVE_MILESTONE"; target: string; after: string | null; reason: string }
+  | { type: "CANCEL_TASK" | "CANCEL_SLICE" | "CANCEL_MILESTONE"; target: string; reason: string }
+  | { type: "CHANGE_REQUIREMENT"; before: string; after: string | null; reason: string };
+export interface ChangeSet { type: "CHANGE"; operations: ChangeOperation[]; }
+export interface ChangeContext { projectHash: string; roadmapHash: string; requirementsHash: string; }
+export interface ProposalPayload {
+  revision: number; requestId: string; rationale: string; patch: Addition | ChangeSet;
+  context?: ChangeContext; preview?: string[];
+}
+export interface WorkProposal extends ProposalPayload { id: string; }
+export interface RequirementAmendment {
+  id: string; before: string; after: string | null; reason: string; origin: WorkOrigin;
+}
 export interface WorkRequest {
-  id: string; text: string; source: "user"; inboxId: string; createdAt: string;
+  id: string; kind?: "add" | "change"; text: string; source: "user"; inboxId: string; createdAt: string;
   status: "queued" | "planning" | "proposed" | "applied" | "rejected" | "conflict" | "failed" | "stale";
   attempts: number; proposal?: WorkProposal; error?: string; resolvedAt?: string;
   appliedRevision?: number;
 }
 export type InboxMessage = {
-  id: string; type: "pause" | "resume" | "capture" | "add" | "approve" | "reject";
+  id: string; type: "pause" | "resume" | "capture" | "add" | "change" | "approve" | "reject";
   note?: string; requestId?: string; proposalId?: string; at: string;
 };

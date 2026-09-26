@@ -1,6 +1,6 @@
 {
   "name": "ship-autopilot",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "File-backed autonomous development controller using OMP as disposable coding workers.",
   "type": "module",
   "bin": {

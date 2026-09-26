@@ -38,22 +38,24 @@ export function validatePlan(value: unknown): asserts value is Milestone[] {
     if (t.dependsOn !== undefined) {
       strings(t.dependsOn, "dependsOn");
       if (new Set(t.dependsOn).size !== t.dependsOn.length) throw new Error("Duplicate dependency");
-      for (const key of t.dependsOn) if (!preceding.has(key)) throw new Error(`Dependency must name an earlier task: ${key}`);
+      for (const key of t.dependsOn) if (t.status !== "cancelled" && !preceding.has(key)) throw new Error(`Dependency must name an earlier task: ${key}`);
     }
-    preceding.add(`${m.id}/${s.id}/${t.id}`);
+    if (t.status !== "cancelled") preceding.add(`${m.id}/${s.id}/${t.id}`);
   }
 }
 export function parsePlan(output: string): Milestone[] {
   const raw: unknown = JSON.parse(output.trim()); object(raw); validatePlan(raw.milestones);
-  return raw.milestones.map(m => ({ ...m, status: "pending", slices: m.slices.map(s => ({ ...s, status: "pending", tasks: s.tasks.map(t => ({ ...t, status: "pending", attempts: 0 })) })) }));
+  const plan: Milestone[] = raw.milestones.map(m => ({ id: m.id, title: m.title, outcome: m.outcome, status: "pending", slices: m.slices.map(s => ({ id: s.id, title: s.title, status: "pending", tasks: s.tasks.map(t => ({ id: t.id, title: t.title, goal: t.goal, acceptance: t.acceptance, verificationCommands: t.verificationCommands, ...(t.dependsOn ? { dependsOn: t.dependsOn } : {}), status: "pending", attempts: 0 })) })) }));
+  validatePlan(plan); return plan;
 }
 export function tasks(state: ShipState) {
   return state.milestones.flatMap(m => m.slices.flatMap(s => s.tasks.map(t => ({ m, s, t, key: `${m.id}/${s.id}/${t.id}`, slice: `${m.id}/${s.id}` }))));
 }
+export function terminal(task: Task): boolean { return task.status === "passed" || task.status === "cancelled"; }
 export function refresh(state: ShipState): void {
   for (const m of state.milestones) {
-    for (const s of m.slices) s.status = s.tasks.every(t => t.status === "passed") ? "complete" : s.tasks.some(t => t.attempts > 0) ? "active" : "pending";
-    m.status = m.slices.every(s => s.status === "complete") ? "complete" : m.slices.some(s => s.status !== "pending") ? "active" : "pending";
+    for (const s of m.slices) s.status = s.tasks.every(t => t.status === "cancelled") ? "cancelled" : s.tasks.every(terminal) ? "complete" : s.tasks.some(t => t.attempts > 0) ? "active" : "pending";
+    m.status = m.slices.every(s => s.status === "cancelled") ? "cancelled" : m.slices.every(s => s.status === "complete" || s.status === "cancelled") ? "complete" : m.slices.some(s => s.status !== "pending") ? "active" : "pending";
   }
 }
 export function applyReview(state: ShipState, output: string, source: string): Review {

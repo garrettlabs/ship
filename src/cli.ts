@@ -47,7 +47,7 @@ export async function startDetached(root: string, args: string[] = []): Promise<
   } finally { await log.close(); }
 }
 function usage() {
-  console.log(`Ship 0.2 — file-backed autonomous controller\n\nship                         open the TUI\nship init --brief <file>      initialize without model calls\nship run [--once] [--detach] [--max-runtime 8h]\nship tui                     attach; q detaches without stopping the run\nship status [--json]\nship pause | resume          queue control at a safe boundary\nship capture "<note>"\nship add "<request>"          queue new requested work, not a capture\nship proposals [W0001] [--json]\nship approve W0001 | reject W0001\nship recover                 unlock a confirmed-dead controller\nship doctor                  no paid model calls`);
+  console.log(`Ship 0.3 — file-backed autonomous controller\n\nship                         open the TUI\nship init --brief <file>      initialize without model calls\nship run [--once] [--detach] [--max-runtime 8h]\nship tui                     attach; q detaches without stopping the run\nship status [--json]\nship pause | resume          queue control at a safe boundary\nship capture "<note>"\nship add "<request>"          queue new requested work, not a capture\nship change "<request>"       propose changes to existing work or requirements\nship proposals [W0001] [--json]\nship approve W0001 | reject W0001\nship recover                 unlock a confirmed-dead controller\nship doctor                  no paid model calls`);
 }
 export async function main(args: string[], root: string): Promise<void> {
   root = await realpath(root);
@@ -67,16 +67,16 @@ export async function main(args: string[], root: string): Promise<void> {
     if (requestId && !selected.length) throw new Error(`Unknown work request: ${requestId}`);
     if (args.includes("--json")) console.log(JSON.stringify(selected, null, 2));
     else {
-      console.log(selected.length ? selected.map(r => describeRequest(r).map(safe).join("\n")).join("\n\n") : "No consumed work requests yet. Start ship run to process queued additions.");
-      console.log("\nInspect new commands before ship approve W0001. Use ship reject W0001 to discard. Decisions apply at a safe boundary.");
+      console.log(selected.length ? selected.map(r => describeRequest(r).map(safe).join("\n")).join("\n\n") : "No consumed work requests yet. Start ship run to process queued requests.");
+      console.log("\nInspect all changes and commands before ship approve W0001. Use ship reject W0001 to discard. Decisions apply at a safe boundary.");
     }
   } else if (command === "approve" || command === "reject") {
     if (args.length !== 2 || !/^W[0-9]{2,}$/.test(args[1])) throw new Error(`Usage: ship ${command} W0001`);
     await queueWorkDecision(root, command, args[1]);
     console.log(`${command} queued for ${args[1]}. Start ship run if the controller has exited.`);
-  } else if (command === "pause" || command === "resume" || command === "capture" || command === "add") {
-    await queueMessage(root, command, command === "capture" || command === "add" ? args.slice(1).join(" ") : undefined);
-    console.log(command === "add" ? "Work request queued. The running controller will propose a task, slice, or milestone at a safe boundary. Start ship run if needed; inspect ship proposals before approving." : `${command} queued.`);
+  } else if (command === "pause" || command === "resume" || command === "capture" || command === "add" || command === "change") {
+    await queueMessage(root, command, command === "capture" || command === "add" || command === "change" ? args.slice(1).join(" ") : undefined);
+    console.log(command === "change" ? "Change request queued. The controller will propose a before/after patch at a safe boundary. Inspect ship proposals and approve or reject it; no work changed yet." : command === "add" ? "Work request queued. The running controller will propose a task, slice, or milestone at a safe boundary. Start ship run if needed; inspect ship proposals before approving." : `${command} queued.`);
   } else if (command === "recover") { await recoverLock(root); console.log("Dead-controller lock cleared. Run ship run to reconcile persisted work."); }
   else if (command === "run") {
     for (let i = 1; i < args.length; i++) {

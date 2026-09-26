@@ -12,7 +12,15 @@ rl.on("line", async line => {
   if (f.type !== "prompt") return;
   send({ type: "response", id: f.id, command: "prompt", success: true });
   await new Promise(resolve => setTimeout(resolve, 600));
-  if (f.message.includes("You are the work intake planner")) {
+  if (f.message.includes("You are the change planner")) {
+    const requestId = /USER REQUEST (W[0-9]+):/.exec(f.message)?.[1];
+    const revision = Number(/"revision":(\d+)/.exec(f.message)?.[1]);
+    // Fixed offline scenario, not a natural-language planner.
+    final = JSON.stringify({ requestId, revision, rationale: "Keep the greeting, write documentation to USAGE.md, and clarify the no-remote-API requirement", patch: { type: "CHANGE", operations: [
+      { type: "MODIFY_TASK", target: "M002/S01/T01", updates: { goal: "Document the greeting in USAGE.md", acceptance: ["USAGE.md describes the greeting"], verificationCommands: ["grep -q 'greeting' USAGE.md"] }, reason: "User requested a different documentation file" },
+      { type: "CHANGE_REQUIREMENT", before: "No external services.", after: "No remote APIs.", reason: "Clarify the user's service constraint" },
+    ] } });
+  } else if (f.message.includes("You are the work intake planner")) {
     const requestId = /USER REQUEST (W[0-9]+):/.exec(f.message)?.[1];
     const revision = Number(/"revision":(\d+)/.exec(f.message)?.[1]);
     // The fixture supports only this fixed example, not arbitrary planning.
@@ -21,11 +29,11 @@ rl.on("line", async line => {
     final = JSON.stringify({ milestones: [1, 2].map(n => ({ id: `M00${n}`, title: n === 1 ? "Greeting" : "Documentation", outcome: n === 1 ? "Greeting available" : "Usage documented", slices: [{ id: "S01", title: "Deliver", tasks: [{ id: "T01", title: n === 1 ? "Create greeting" : "Document greeting", goal: n === 1 ? "Write greeting.txt containing hello from ship" : "Document the greeting in README.md", acceptance: [n === 1 ? "Greeting file contains expected text" : "README describes greeting"], verificationCommands: [n === 1 ? "grep -q 'hello from ship' greeting.txt" : "grep -q 'greeting' README.md"] }] }] })) });
   } else if (f.message.includes("Review completed slice")) {
     const revision = Number(/"revision":(\d+)/.exec(f.message)?.[1]);
-    final = JSON.stringify({ revision, rationale: "Reuse verified output without changing acceptance", lessons: [{ kind: "lesson", text: "A text fixture can demonstrate this controller without paid calls.", evidence: "completed task acceptance command" }], changes: f.message.includes("Review completed slice M001/") ? [{ task: "M002/S01/T01", goal: "Document the verified greeting.txt and show how to read it", reason: "reuse the delivered greeting" }] : [] });
+    final = JSON.stringify({ revision, rationale: "Reuse verified output without changing acceptance", lessons: [{ kind: "lesson", text: "A text fixture can demonstrate this controller without paid calls.", evidence: "completed task acceptance command" }], changes: f.message.includes("Review completed slice M001/") ? [{ task: "M002/S01/T01", goal: f.message.includes("USAGE.md") ? "Document the verified greeting.txt in USAGE.md" : "Document the verified greeting.txt and show how to read it", reason: "reuse the delivered greeting" }] : [] });
   } else {
     const changelog = f.message.includes('"title":"Create changelog"');
     const docs = f.message.includes('"title":"Document greeting"');
-    await writeFile(changelog ? "CHANGELOG.md" : docs ? "README.md" : "greeting.txt", changelog ? "# Changes\nDelivered greeting and usage documentation.\n" : docs ? "# Greeting\nRead the greeting with `cat greeting.txt`.\n" : "hello from ship\n");
+    await writeFile(changelog ? "CHANGELOG.md" : docs ? (f.message.includes("USAGE.md") ? "USAGE.md" : "README.md") : "greeting.txt", changelog ? "# Changes\nDelivered greeting and usage documentation.\n" : docs ? "# Greeting\nRead the greeting with `cat greeting.txt`.\n" : "hello from ship\n");
     final = JSON.stringify({ summary: changelog ? "Recorded the delivered greeting" : docs ? "Documented the greeting" : "Created greeting", observations: ["Acceptance can be checked with grep."] });
   }
   send({ type: "prompt_result", id: f.id, status: "completed", sessionSettled: true });
