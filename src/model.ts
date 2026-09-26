@@ -1,5 +1,6 @@
 import type { Milestone, Review, RoadmapEdit, ShipState, Task, TaskType, TaskUncertainty } from "./types.ts";
 import { classifyTask } from "./task-classification.ts";
+import { DependencyGraph } from "./dependency-graph.ts";
 
 function object(x: unknown): asserts x is Record<string, unknown> {
   if (!x || typeof x !== "object" || Array.isArray(x)) throw new Error("Expected an object");
@@ -97,15 +98,7 @@ export function validatePlan(value: unknown): asserts value is Milestone[] {
     unique(m.slices as Milestone["slices"]);
   }
   unique(value);
-  const preceding = new Set<string>();
-  for (const m of value) for (const s of m.slices) for (const t of s.tasks) {
-    if (new Set(t.dependencies).size !== t.dependencies.length) throw new Error(`Duplicate task dependency: ${t.id}`);
-    for (const dep of t.dependencies) {
-      const key = dep.includes("/") ? dep : `${m.id}/${s.id}/${dep}`;
-      if (!preceding.has(key)) throw new Error(`Invalid or nonpreceding task dependency: ${dep}`);
-    }
-    preceding.add(`${m.id}/${s.id}/${t.id}`);
-  }
+  new DependencyGraph(value);
 }
 export function parsePlan(output: string): Milestone[] {
   const raw: unknown = JSON.parse(output.trim()); object(raw);

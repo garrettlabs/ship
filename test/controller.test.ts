@@ -23,6 +23,29 @@ test("two milestones finish with verified commits in an isolated worktree", asyn
   assert.equal(await git(s.workspace!.path, ["ls-files", ".ship"]), "");
 });
 
+test("serial execution follows forward dependencies and repairs a failed prerequisite before its descendants", async t => {
+  const root = await fixture(t);
+  const raw = JSON.parse(plan());
+  const first = raw.milestones[0].slices[0].tasks[0];
+  raw.milestones[0].slices[0].tasks = [
+    { ...first, id: "T01", goal: "create file1.txt after file2.txt", dependencies: ["T02"] },
+    { ...first, id: "T02", goal: "create file2.txt", verificationCommands: ["grep -q '^hello$' file2.txt"] },
+  ];
+  const worker = new ScriptWorker([{ ok: true, text: JSON.stringify(raw) },
+    { ok: false, text: "", error: "temporary failure", retryable: true },
+    write("file2.txt"),
+    async (_prompt, cwd) => {
+      assert.equal(await readFile(path.join(cwd, "file2.txt"), "utf8"), "hello\n");
+      await writeFile(path.join(cwd, "file1.txt"), "hello\n");
+      return report();
+    },
+  ]);
+  assert.equal(await new Controller(root, worker).run(), "complete");
+  const state = await loadState(root);
+  assert.deepEqual(state.milestones[0].slices[0].tasks.map(task => task.attempts), [1, 2]);
+  assert.deepEqual(state.milestones[0].slices[0].tasks.map(task => task.status), ["passed", "passed"]);
+});
+
 test("failed acceptance evidence reaches a successful repair prompt", async t => {
   const root = await fixture(t);
   const worker = new ScriptWorker([{ ok: true, text: plan() }, write("file1.txt", "wrong\n"), async (prompt, cwd) => {

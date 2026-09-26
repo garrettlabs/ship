@@ -108,11 +108,13 @@ ship doctor
 
 ## Execution-plan task metadata
 
-Each task persists its objective (intended outcome), editable goal (implementation approach), preceding task dependencies, descriptive acceptance and verification requirements, controller-run verification commands, known affected domains/files, semantic task type, uncertainty, complexity, risk, parallel eligibility, execution route, and status. Supported semantic types include reconnaissance, planning/design, implementation, test, documentation, integration, review, and security review. The planner supplies scope and requirements; reusable SHIP core code derives classification. These fields do **not** spawn parallel workers or select a model/provider; execution remains serial and acceptance still depends on controller-run checks.
+Each task persists its objective (intended outcome), editable goal (implementation approach), task dependencies, descriptive acceptance and verification requirements, controller-run verification commands, known affected domains/files, semantic task type, uncertainty, complexity, risk, parallel eligibility, execution route, and status. Supported semantic types include reconnaissance, planning/design, implementation, test, documentation, integration, review, and security review. The planner supplies scope and requirements; reusable SHIP core code derives classification. These fields do **not** spawn parallel workers or select a model/provider; execution remains serial and acceptance still depends on controller-run checks.
 
 Complexity is deterministic: multiple dependencies/domains, four or more affected files, high uncertainty, migration or integration mark a task `COMPLEX`; a focused known single-file documentation/test/configuration task with low uncertainty and no dependencies is `TRIVIAL`; other tasks are `STANDARD`. Risk is independent: explicit auth, secrets, destructive operations, migration/schema, persisted-data, filesystem-deletion, permissions or network/security signals in task scope or verification requirements produce `HIGH`; the migration task type itself is a risk signal. Absent signals with unknown uncertainty produce `UNKNOWN`, not an assertion of safety. Persisted rationale and signals explain the result. Neither classification nor agent descriptions replace acceptance evidence.
 
 Existing schema-v1 projects load safely: missing task metadata is derived in memory, without rewriting `.ship/state.json` on read; the next normal state save writes it atomically. Legacy status, attempt counts, roadmap revisions, frozen commands and recovery evidence are not reinterpreted. Unknown affected scope stays empty and uncertainty stays `UNKNOWN`.
+
+The dependency engine validates missing, self, duplicate and cyclic edges; it produces stable topological order and levels. The controller still runs **one** ready task at a time, only after its prerequisites pass. Failed tasks remain retryable under existing budgets; descendants blocked by failed prerequisites are a derived view, not persisted `blocked` statuses. Parallel candidate pairs are recommendations only: both tasks must be ready and independent, have explicit disjoint likely-write ownership, and avoid migration, integration or shared-mutable boundaries. Unknown or ambiguous ownership yields no recommendation; no agents run concurrently.
 
 
 ## State and crash behavior
@@ -169,6 +171,6 @@ On Windows Command Prompt, use `set SHIP_LIVE_OMP=1&& npm run smoke`. The script
 
 ## Remaining MVP work
 
-This is still a small serial planner: it produces the initial task hierarchy eagerly. Full just-in-time slice expansion, structural roadmap edits (reordering/splitting/adding milestones), dependency graphs, user approval workflows, general diagnostic replanning, and cross-milestone knowledge retrieval are not implemented.
+This is still a small serial planner: it produces the initial task hierarchy eagerly. Full just-in-time slice expansion, structural roadmap edits (reordering/splitting/adding milestones), parallel agent execution, user approval workflows, general diagnostic replanning, and cross-milestone knowledge retrieval are not implemented.
 
 The next priority is a bounded unattended trial, followed by broader planning/reassessment operations. Do not treat one live smoke or the offline tests as evidence that arbitrary overnight software development is reliable.

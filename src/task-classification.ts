@@ -13,7 +13,7 @@ export function classifyTask(task: ClassificationInput): Classification {
   signal("authn/authz", /\b(auth(?:entication|orization|n|z)?|login|logins|oauth|access control|session tokens?)\b/);
   signal("secrets", /\b(secrets?|credentials?|api keys?|private keys?|passwords?|tokens?)\b/);
   signal("destructive operations", /\b(destructive|drop table|truncate table|wipe|erase|purge|delet(?:e|ion) (?:accounts?|records?|data|repositories?|environments?))\b/);
-  if (task.taskType === "migration" || /\b(migrat(?:e|ion|ions)|schema|database table|ddl)\b/.test(description)) signals.push("migration/schema");
+  if (task.taskType === "migration" || /\b(migrat(?:e|ing|ion|ions)|schema|database table|ddl)\b/.test(description)) signals.push("migration/schema");
   signal("persisted data", /\b(persist(?:ed|ent|ence)? data|stored data|database|data retention)\b/);
   if (/\b(delet(?:e|ion)|remov(?:e|al))\b.{0,40}\b(files?|directories|folders?)\b|\b(files?|directories|folders?)\b.{0,40}\b(delet(?:e|ion)|remov(?:e|al))\b/.test(description) || /\brm\s+-(?:[a-z]*r[a-z]*f|[a-z]*f[a-z]*r)\b/.test(commands)) signals.push("filesystem deletion");
   signal("permissions", /\b(permissions?|privileges?|chmod|chown|acl)\b/);

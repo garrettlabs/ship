@@ -6,6 +6,7 @@ import { appendEvent, atomicJson, consumeInbox, loadConfig, loadState, readJson,
 import { candidateTree, clean, commitCandidate, ensureWorkspace, head, matchesCommit } from "./git.ts";
 import { executorPrompt, plannerPrompt, reviewPrompt } from "./prompts.ts";
 import { applyReview, parsePlan, refresh, tasks } from "./model.ts";
+import { DependencyGraph } from "./dependency-graph.ts";
 import { acquireLock } from "./lock.ts";
 import { assertNoProcess, runCheck } from "./process.ts";
 
@@ -113,11 +114,14 @@ export class Controller {
       s.reviewedSlices!.push(key); s.phase = "idle";
       await this.persist(s, "roadmap_reassessed", { slice: key, revision: s.roadmapRevision }); return "progress";
     }
-    const next = tasks(s).find(x => x.t.status !== "passed");
-    if (!next) { s.phase = "complete"; await this.persist(s, "project_completed"); return "complete"; }
+    const entries = tasks(s), graph = new DependencyGraph(s.milestones);
+    const interrupted = entries.find(x => x.t.status === "running" || x.t.status === "verifying");
+    if (interrupted) return this.block(s, "Legacy interrupted task has no attempt record; manual reconciliation required");
+    const ready = graph.readyTasks()[0];
+    if (!ready && entries.every(x => x.t.status === "passed")) { s.phase = "complete"; await this.persist(s, "project_completed"); return "complete"; }
+    if (!ready) return this.block(s, "No task is ready; unresolved prerequisites remain");
     if ((s.dispatches ?? 0) >= config.limits.maxDispatches) return this.block(s, "Persistent dispatch budget exhausted");
-    const { t, key, m, s: slice } = next;
-    if (t.status === "running" || t.status === "verifying") return this.block(s, "Legacy interrupted task has no attempt record; manual reconciliation required");
+    const { t, key, m, s: slice } = entries.find(x => x.key === ready.key)!;
     if (t.attempts >= config.limits.maxTaskAttempts) return this.block(s, `${key} exhausted its persistent repair budget`);
     t.attempts++; t.status = "running"; s.phase = "executing";
     s.current = { milestoneId: m.id, sliceId: slice.id, taskId: t.id };
