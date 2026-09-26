@@ -130,7 +130,7 @@ test("legacy state normalization preserves active attempt and commits only on sa
   state.activeAttempt = { id: "attempt-3", key: "M001/S01/T01", baseHead: "base", stage: "verifying", commands: ["frozen check"], revision: 6, tree: "tree" };
   const legacy = structuredClone(state);
   const old = legacy.milestones[0].slices[0].tasks[0] as unknown as Record<string, unknown>;
-  for (const key of ["objective", "dependencies", "affectedDomains", "affectedFiles", "taskType", "uncertainty", "verificationRequirements", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute", "execution"]) delete old[key];
+  for (const key of ["objective", "dependencies", "affectedDomains", "affectedFiles", "taskType", "uncertainty", "verificationRequirements", "verificationPlan", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute", "execution"]) delete old[key];
   await atomicJson(statePath(root), legacy);
   const before = await readFile(statePath(root), "utf8");
   const migrated = await loadState(root);
@@ -140,6 +140,7 @@ test("legacy state normalization preserves active attempt and commits only on sa
   assert.equal(migrated.milestones[0].slices[0].tasks[0].attempts, 3);
   assert.equal(migrated.milestones[0].slices[0].tasks[0].objective, old.goal);
   assert.equal(migrated.milestones[0].slices[0].tasks[0].execution.role, "task");
+  assert.deepEqual(migrated.milestones[0].slices[0].tasks[0].verificationPlan.requirements.map(r => r.command), existing.verificationCommands);
   await saveState(root, migrated);
   const reloaded = await loadState(root);
   assert.deepEqual(reloaded.activeAttempt, legacy.activeAttempt);
@@ -150,6 +151,9 @@ test("legacy state normalization preserves active attempt and commits only on sa
   const corrupted = structuredClone(reloaded); corrupted.milestones[0].slices[0].tasks[0].risk = "LOW";
   await atomicJson(statePath(root), corrupted);
   await assert.rejects(loadState(root), /Invalid persisted risk/);
+  const tamperedVerification = structuredClone(reloaded); tamperedVerification.milestones[0].slices[0].tasks[0].verificationPlan.requirements[0].reason = "manual override";
+  await atomicJson(statePath(root), tamperedVerification);
+  await assert.rejects(loadState(root), /Invalid persisted verificationPlan/);
 });
 
 test("goal-only edits retain stable objectives, acceptance, checks, and refreshed classification", async t => {

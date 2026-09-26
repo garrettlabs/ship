@@ -26,7 +26,8 @@ export async function readJson<T>(file: string): Promise<T> { return JSON.parse(
 export async function loadState(root: string): Promise<ShipState> {
   const s = await readJson<ShipState>(statePath(root));
   if (s.schemaVersion !== 1 || !Array.isArray(s.milestones) || typeof s.paused !== "boolean" || !Number.isInteger(s.roadmapRevision)) throw new Error("Invalid state.json");
-  if (s.milestones.length) s.milestones = normalizePlan(s.milestones);
+  if (s.repoChecks !== undefined && (!Array.isArray(s.repoChecks) || s.repoChecks.some(c => !c || !["focused-tests", "broader-tests", "typecheck", "lint", "build", "integration"].includes(c.kind) || typeof c.command !== "string" || !c.command.trim() || typeof c.source !== "string" || !c.source.trim()))) throw new Error("Invalid persisted repo checks");
+  if (s.milestones.length) s.milestones = normalizePlan(s.milestones, false, s.repoChecks);
   s.knowledge ??= []; s.processedInbox ??= []; s.reviewedSlices ??= []; s.reviewAttempts ??= {}; s.dispatches ??= 0; s.planningFailures ??= 0;
   return s;
 }
