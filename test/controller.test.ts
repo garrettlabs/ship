@@ -268,3 +268,67 @@ test("adding above the 200-task plan cap is rejected without a partial revision"
   assert.equal(state.roadmapRevision, 1);
   assert.match(state.blockedReason!, /200 tasks/);
 });
+
+test("queued add persists complete routed execution metadata and generated plan across reload", async t => {
+  const root = await fixture(t);
+  const controller = new Controller(root, new ScriptWorker([{ ok: true, text: plan() }]));
+  await controller.step();
+  await main(["add", "--slice", "M001/S01", "--title", "Document authentication", "--goal", "Document authentication permissions", "--acceptance", "documentation covers access", "--check", "test -f docs/access.md", "--revision", "1", "--type", "documentation", "--uncertainty", "LOW", "--depends", "T01", "--files", "docs/access.md", "--domains", "docs", "--verify", "Review access coverage"], root);
+  assert.equal((await loadState(root)).milestones[0].slices[0].tasks.length, 1);
+  await queueMessage(root, "pause");
+  assert.equal(await controller.step(), "paused");
+  const state = await loadState(root), added = state.milestones[0].slices[0].tasks[1];
+  assert.equal(state.roadmapRevision, 2);
+  assert.deepEqual(added.dependencies, ["T01"]); assert.equal(added.dependencyLevel, 1);
+  assert.equal(added.taskType, "documentation"); assert.equal(added.complexity, "STANDARD"); assert.equal(added.risk, "HIGH");
+  assert.deepEqual(added.affectedFiles, ["docs/access.md"]); assert.deepEqual(added.affectedDomains, ["docs"]);
+  assert.equal(added.parallelEligible, false); assert.equal(added.execution.role, "task");
+  assert.equal(added.execution.verificationSpecialist, "security-reviewer");
+  assert.deepEqual(added.verificationRequirements, ["documentation covers access", "Review access coverage"]);
+  assert.ok(added.verificationPlan.requirements.some(requirement => requirement.kind === "security-review"));
+  const representation = JSON.parse(await readFile(path.join(shipDir(root), "EXECUTION_PLAN.json"), "utf8"));
+  assert.equal(representation.revision, 2);
+  assert.deepEqual(representation.levels, [["M001/S01/T01"], ["M001/S01/T02"]]);
+  assert.deepEqual(representation.tasks[1].prerequisites, ["M001/S01/T01"]);
+  assert.deepEqual(representation.tasks[1].execution, added.execution);
+  assert.match(await readFile(path.join(shipDir(root), "EXECUTION_PLAN.md"), "utf8"), /Dependency level: 1; prerequisites: M001\/S01\/T01/);
+  assert.deepEqual((await loadState(root)).milestones[0].slices[0].tasks[1], added);
+});
+
+test("changing an unstarted task recomputes dependency levels, ownership, route and verification without rewriting acceptance", async t => {
+  const root = await fixture(t);
+  const raw = JSON.parse(plan()); const first = raw.milestones[0].slices[0].tasks[0];
+  raw.milestones[0].slices[0].tasks.push({ ...first, id: "T02", goal: "Prepare second file", dependencies: ["T01"] }, { ...first, id: "T03", goal: "Prepare third file", dependencies: ["T02"] });
+  const controller = new Controller(root, new ScriptWorker([{ ok: true, text: JSON.stringify(raw) }]));
+  await controller.step(); const previous = await loadState(root);
+  await main(["change", "--task", "M001/S01/T02", "--goal", "Document authentication access", "--revision", "1", "--type", "documentation", "--uncertainty", "LOW", "--depends", "-", "--files", "docs/access.md", "--domains", "docs", "--verify", "Confirm access details"], root);
+  await queueMessage(root, "pause"); assert.equal(await controller.step(), "paused");
+  const current = await loadState(root), changed = current.milestones[0].slices[0].tasks[1];
+  assert.equal(changed.dependencyLevel, 0); assert.equal(current.milestones[0].slices[0].tasks[2].dependencyLevel, 1);
+  assert.deepEqual(changed.dependencies, []); assert.equal(changed.objective, changed.goal);
+  assert.equal(changed.risk, "HIGH"); assert.equal(changed.execution.verificationSpecialist, "security-reviewer");
+  assert.deepEqual(changed.affectedFiles, ["docs/access.md"]); assert.equal(changed.uncertainty, "LOW");
+  assert.deepEqual(changed.acceptance, previous.milestones[0].slices[0].tasks[1].acceptance);
+  assert.deepEqual(changed.verificationCommands, previous.milestones[0].slices[0].tasks[1].verificationCommands);
+  assert.ok(changed.verificationRequirements.includes("Confirm access details"));
+  assert.deepEqual((await loadState(root)).milestones, current.milestones);
+});
+
+test("cyclic and missing prerequisite mutations reject without changing persisted graph or revision", async t => {
+  const root = await fixture(t), raw = JSON.parse(plan());
+  const first = raw.milestones[0].slices[0].tasks[0];
+  raw.milestones[0].slices[0].tasks.push({ ...first, id: "T02", dependencies: ["T01"] });
+  const controller = new Controller(root, new ScriptWorker([{ ok: true, text: JSON.stringify(raw) }]));
+  await controller.step(); const baseline = await loadState(root);
+  await queueRoadmapEdit(root, { type: "change", task: "M001/S01/T01", goal: "Cycle", dependencies: ["T02"], revision: 1 });
+  assert.equal(await controller.step(), "blocked");
+  let rejected = await loadState(root);
+  assert.match(rejected.blockedReason!, /Rejected inbox\/.*Cyclic task dependency/);
+  assert.equal(rejected.roadmapRevision, 1); assert.deepEqual(rejected.milestones, baseline.milestones);
+  await queueMessage(root, "resume");
+  await queueRoadmapEdit(root, { type: "add", slice: "M001/S01", title: "Missing", goal: "Missing prerequisite", acceptance: "works", check: "true", dependencies: ["T99"], revision: 1 });
+  assert.equal(await controller.step(), "blocked");
+  rejected = await loadState(root);
+  assert.match(rejected.blockedReason!, /Rejected inbox\/.*Missing task dependency/);
+  assert.equal(rejected.roadmapRevision, 1); assert.deepEqual(rejected.milestones, baseline.milestones);
+});

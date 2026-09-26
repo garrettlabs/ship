@@ -18,6 +18,7 @@ export interface RepoCheck { kind: Exclude<VerificationKind, "independent-review
 export interface VerificationRequirement { kind: VerificationKind; reason: string; command?: string; }
 export interface VerificationPlan { requirements: VerificationRequirement[]; }
 export interface Task {
+  dependencyLevel: number;
   id: string; title: string; objective: string; goal: string; dependencies: string[];
   acceptance: string[]; affectedDomains: string[]; affectedFiles: string[];
   taskType: TaskType; complexity: TaskComplexity; risk: TaskRisk; uncertainty: TaskUncertainty;
@@ -39,9 +40,13 @@ export interface Attempt {
   id: string; key: string; baseHead: string; stage: "executing" | "verifying" | "committing";
   commands: string[]; revision: number; summary?: string; tree?: string;
 }
+export interface PlanningHints {
+  taskType?: TaskType; uncertainty?: TaskUncertainty; dependencies?: string[];
+  affectedFiles?: string[]; affectedDomains?: string[]; verificationRequirements?: string[];
+}
 export type RoadmapEdit =
-  | { type: "add"; slice: string; title: string; goal: string; acceptance: string; check: string; revision: number }
-  | { type: "change"; task: string; goal: string; revision: number };
+  | ({ type: "add"; slice: string; title: string; goal: string; acceptance: string; check: string; revision: number } & PlanningHints)
+  | ({ type: "change"; task: string; goal: string; revision: number } & PlanningHints);
 export type InboxMessage =
   | { id: string; type: "pause" | "resume"; at: string }
   | { id: string; type: "capture"; note: string; at: string }

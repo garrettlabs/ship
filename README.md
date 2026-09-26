@@ -50,9 +50,9 @@ Install dependencies with `npm ci`, then start OMP from an initialized Ship proj
 omp -e /path/to/ship/extensions/ship.ts
 ```
 
-`/ship` shows help; `/ship status` reads the supervisor's state through the standalone CLI. `/ship run` confirms before requesting a detached controller launch; paid model calls may follow. `/ship pause` and `/ship resume` queue safe-boundary controls. `/ship add` selects an existing slice and asks for a task title, goal, acceptance description, and executable verification command; `/ship change` updates only the goal of an unstarted, unattempted task. Both submit revision-checked roadmap edits to the supervisor inbox. They are **queued, not applied immediately**: the controller validates and applies them at its next safe boundary, or blocks with an explicit rejection reason if the revision or target has changed. While an attempt is active, edits wait until its reconciliation finishes. The extension does not run the controller internally or change `.ship/state.json` directly.
+`/ship` shows help; `/ship status` reads the supervisor's state through the standalone CLI. `/ship run` confirms before requesting a detached controller launch; paid model calls may follow. `/ship pause` and `/ship resume` queue safe-boundary controls. `/ship add` selects a slice, gathers the title, goal, acceptance text and executable check, then offers optional semantic type, uncertainty, prerequisites, owned files/domains and an extra verification requirement. `/ship change` updates the goal and optionally those planning hints for an unstarted, unattempted task; acceptance text and executable checks cannot be replaced. Both submit revision-checked edits to the inbox. They are **queued, not applied immediately**: the controller validates and applies them at its next safe boundary, or blocks with an explicit rejection reason. While an attempt is active, roadmap edits wait for reconciliation.
 
-The standalone `ship` CLI remains available. For noninteractive use, `ship add --slice M001/S01 --title TITLE --goal GOAL --acceptance TEXT --check COMMAND --revision N` and `ship change --task M001/S01/T01 --goal GOAL --revision N` submit the same requests; read the current revision with `ship status --json`. Only edits to unstarted work are allowed; existing task checks and acceptance criteria cannot be weakened through `change`. A `resume` request does not itself restart a stopped controller.
+The standalone CLI accepts `ship add --slice M001/S01 --title TITLE --goal GOAL --acceptance TEXT --check COMMAND --revision N` and `ship change --task M001/S01/T01 --goal GOAL --revision N`. Both accept optional `--type TYPE --uncertainty LOW|MEDIUM|HIGH|UNKNOWN --depends TASK[,TASK] --files PATH[,PATH] --domains NAME[,NAME] --verify TEXT`; `--depends`, `--files` and `--domains` accept `-` to clear an existing list on change. Unqualified prerequisites refer to tasks in the same slice; cross-slice references use `M001/S01/T01`. Omitted hints on change retain their values; additional verification requirements are appended without removing existing ones. Read the current revision with `ship status --json`. A `resume` request does not itself restart a stopped controller.
 
 
 `--once` includes necessary planning and bounded repairs, then stops after one accepted task. The default run continues through slice reviews and subsequent milestones until the approved plan is complete, blocked, paused, cancelled, or limited by its runtime/dispatch budget.
@@ -86,8 +86,8 @@ ship status [--json]
 ship pause
 ship resume
 ship capture "<note>"
-ship add --slice M001/S01 --title TITLE --goal GOAL --acceptance TEXT --check COMMAND --revision N
-ship change --task M001/S01/T01 --goal GOAL --revision N
+ship add --slice M001/S01 --title TITLE --goal GOAL --acceptance TEXT --check COMMAND --revision N [--type TYPE] [--uncertainty LEVEL] [--depends TASK[,TASK]] [--files PATH[,PATH]] [--domains NAME[,NAME]] [--verify TEXT]
+ship change --task M001/S01/T01 --goal GOAL --revision N [same optional planning hints]
 ship recover
 ship doctor
 ```
@@ -108,7 +108,7 @@ ship doctor
 
 ## Execution-plan task metadata
 
-Each task persists its objective (intended outcome), editable goal (implementation approach), task dependencies, descriptive acceptance and verification requirements, controller-run verification commands, known affected domains/files, semantic task type, uncertainty, complexity, risk, parallel eligibility, execution route, role-routing decision, and status. Supported semantic types include reconnaissance, planning/design, implementation, test, documentation, integration, review, and security review. The planner supplies scope and requirements; reusable SHIP core code derives classification and routing. These fields do **not** spawn parallel workers or select a model/provider; execution remains serial and acceptance still depends on controller-run checks.
+Each task persists its editable goal/objective, prerequisites and validated DAG dependency level, acceptance and verification requirements, controller-run verification commands, known ownership domains/files, semantic task type, uncertainty, complexity, risk, parallel eligibility, execution route, role-routing decision with reason, and status. Supported semantic types include reconnaissance, planning/design, implementation, test, documentation, integration, review, and security review. Initial planning and queued additions derive classification and routing through reusable SHIP core code. Changing an unstarted goal refreshes the objective and recomputes classification, role and verification policy against the preserved acceptance/checks and any supplied planning hints; graph validation rejects missing, self, duplicate or cyclic dependencies before committing the revision. These fields do **not** spawn parallel workers or select a model/provider; execution remains serial and acceptance still depends on controller-run checks.
 
 Complexity is deterministic: multiple dependencies/domains, four or more affected files, high uncertainty, migration or integration mark a task `COMPLEX`; a focused known single-file documentation/test/configuration task with low uncertainty and no dependencies is `TRIVIAL`; other tasks are `STANDARD`. Risk is independent: explicit auth, secrets, destructive operations, migration/schema, persisted-data, filesystem-deletion, permissions or network/security signals in task scope or verification requirements produce `HIGH`; the migration task type itself is a risk signal. Absent signals with unknown uncertainty produce `UNKNOWN`, not an assertion of safety. Persisted rationale and signals explain the result. Neither classification nor agent descriptions replace acceptance evidence.
 
@@ -118,7 +118,7 @@ Complexity is deterministic: multiple dependencies/domains, four or more affecte
 Only successful controller-run commands with matching attempt evidence count as completed checks; an executor report or source edit is not verification. Independent and security review requirements cannot be satisfied by a shell-command exit code or the existing slice-level roadmap review. SHIP does not launch verification reviewers yet: a task requiring one remains blocked with its missing requirement visible rather than being committed or marked passed. Likewise integration work without a declared integration check blocks instead of silently treating acceptance as integration evidence. Configure relevant project checks before planning where possible; `protectedChecks` remain additional required commands.
 
 
-Existing schema-v1 projects load safely: missing task metadata is derived in memory, without rewriting `.ship/state.json` on read; the next normal state save writes it atomically. Legacy status, attempt counts, roadmap revisions, frozen commands and recovery evidence are not reinterpreted. Unknown affected scope stays empty and uncertainty stays `UNKNOWN`.
+Existing schema-v1 projects load safely: missing task metadata and dependency levels are derived in memory, without rewriting `.ship/state.json` on read; the next normal state save writes them atomically. Legacy status, attempt counts, roadmap revisions, frozen commands and recovery evidence are not reinterpreted. Unknown affected scope stays empty and uncertainty stays `UNKNOWN`. The generated `.ship/EXECUTION_PLAN.json` contains the revision, DAG levels, qualified prerequisites and complete per-task planning decisions; `.ship/EXECUTION_PLAN.md` presents the same decisions for human inspection. Both views update at normal state persistence boundaries and are not authoritative over `state.json`.
 
 The dependency engine validates missing, self, duplicate and cyclic edges; it produces stable topological order and levels. The controller still runs **one** ready task at a time, only after its prerequisites pass. Failed tasks remain retryable under existing budgets; descendants blocked by failed prerequisites are a derived view, not persisted `blocked` statuses. Parallel candidate pairs are recommendations only: both tasks must be ready and independent, have explicit disjoint likely-write ownership, and avoid migration, integration or shared-mutable boundaries. Unknown or ambiguous ownership yields no recommendation; no agents run concurrently.
 
@@ -131,6 +131,8 @@ The dependency engine validates missing, self, duplicate and cyclic edges; it pr
   config.json          user-owned limits, worker command, protected checks
   state.json           authoritative snapshot and commit intent
   ROADMAP.md           generated view
+  EXECUTION_PLAN.json generated machine-readable execution plan
+  EXECUTION_PLAN.md   generated human-readable execution plan
   KNOWLEDGE.md         generated, attributed knowledge view
   events.jsonl         audit only; never used to infer task completion
   attempts/            results, verification evidence, review proposals
