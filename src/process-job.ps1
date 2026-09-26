@@ -60,7 +60,7 @@ try {
     if ([Console]::In.ReadLine() -ne 'ACK') { throw 'Host disconnected before assignment' }
     if (-not [ShipJob]::AssignProcessToJobObject($job, $hostProcess)) { Fail 'AssignProcessToJobObject' }
     [Console]::Out.WriteLine('READY')
-    # On an ordinary host exit or a controller crash, EOF closes the job.
+    # On host exit or an interrupted verification run, EOF closes the job.
     while ($null -ne [Console]::In.ReadLine()) { }
 } catch {
     [Console]::Error.WriteLine($_.Exception.Message)

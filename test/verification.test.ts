@@ -1,14 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { Controller } from "../src/controller.ts";
-import { git } from "../src/git.ts";
 import { parsePlan } from "../src/model.ts";
-import { loadState, shipDir } from "../src/store.ts";
 import { discoverRepoChecks, missingVerification, routeVerification } from "../src/verification.ts";
-import { fixture, plan, ScriptWorker, write } from "./helpers.ts";
+import { plan } from "./helpers.ts";
 
 const planned = (patch: Record<string, unknown> = {}) => {
   const raw = JSON.parse(plan()); Object.assign(raw.milestones[0].slices[0].tasks[0], patch);
@@ -54,48 +51,4 @@ test("verification distinguishes trivial docs, ordinary code, complex integratio
   assert.deepEqual(missingVerification(routeVerification(sensitive, checks), []), routeVerification(sensitive, checks).requirements.map(r => `${r.kind}: ${r.reason}`));
   const withoutIntegration = routeVerification(complex, []);
   assert.ok(withoutIntegration.requirements.some(r => r.kind === "integration" && !r.command));
-});
-
-test("native checks are frozen, executed and recorded before an ordinary task can pass", async t => {
-  const root = await fixture(t);
-  await writeFile(path.join(root, "package.json"), JSON.stringify({ scripts: { "test:unit": "node -e \"process.exit(0)\"", typecheck: "node -e \"process.exit(0)\"" } }));
-  await git(root, ["add", "package.json"]); await git(root, ["commit", "-m", "add checks"]);
-  const raw = JSON.parse(plan()); Object.assign(raw.milestones[0].slices[0].tasks[0], { taskType: "implementation", uncertainty: "LOW", affectedFiles: ["file1.txt"] });
-  const c = new Controller(root, new ScriptWorker([{ ok: true, text: JSON.stringify(raw) }, write()]));
-  assert.equal(await c.run(), "complete");
-  const state = await loadState(root);
-  const task = state.milestones[0].slices[0].tasks[0];
-  assert.deepEqual(task.verificationPlan.requirements.map(r => r.kind), ["focused-tests", "focused-tests", "typecheck"]);
-  const evidence = JSON.parse(await readFile(path.join(shipDir(root), "attempts/M001-S01-T01-a1.verification.json"), "utf8"));
-  assert.deepEqual(evidence.checks.map((check: { command: string }) => check.command), task.verificationPlan.requirements.map(r => r.command));
-  assert.equal(evidence.passed, true);
-});
-
-test("required independent review without review evidence cannot become verified success", async t => {
-  const root = await fixture(t);
-  const raw = JSON.parse(plan()); Object.assign(raw.milestones[0].slices[0].tasks[0], { taskType: "implementation", uncertainty: "LOW", affectedFiles: ["a", "b", "c", "d"] });
-  const c = new Controller(root, new ScriptWorker([{ ok: true, text: JSON.stringify(raw) }, write()]));
-  assert.equal(await c.run(), "blocked");
-  const state = await loadState(root), task = state.milestones[0].slices[0].tasks[0];
-  assert.equal(task.status, "verifying");
-  assert.match(state.blockedReason!, /independent-review/);
-  const evidence = JSON.parse(await readFile(path.join(shipDir(root), "attempts/M001-S01-T01-a1.verification.json"), "utf8"));
-  assert.equal(evidence.passed, false);
-  assert.equal(await git(state.workspace!.path, ["rev-list", "--count", "HEAD"]), "1");
-});
-
-test("high-risk changes require security review and integration without a check cannot pass", async t => {
-  const root = await fixture(t);
-  const raw = JSON.parse(plan()); Object.assign(raw.milestones[0].slices[0].tasks[0], {
-    taskType: "integration", uncertainty: "LOW", goal: "update authentication across api and ui",
-    affectedDomains: ["api", "ui"],
-  });
-  const c = new Controller(root, new ScriptWorker([{ ok: true, text: JSON.stringify(raw) }, write()]));
-  assert.equal(await c.run(), "blocked");
-  const state = await loadState(root), task = state.milestones[0].slices[0].tasks[0];
-  assert.equal(task.status, "verifying");
-  assert.equal(task.verificationPlan.requirements.some(r => r.kind === "independent-review"), false);
-  assert.match(state.blockedReason!, /integration:.*security-review:/);
-  const evidence = JSON.parse(await readFile(path.join(shipDir(root), "attempts/M001-S01-T01-a1.verification.json"), "utf8"));
-  assert.equal(evidence.passed, false);
 });

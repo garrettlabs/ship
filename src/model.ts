@@ -1,4 +1,4 @@
-import type { Milestone, RepoCheck, Review, RoadmapEdit, ShipState, Task, TaskType, TaskUncertainty } from "./types.ts";
+import type { Milestone, RepoCheck, RoadmapEdit, ShipState, Task, TaskType, TaskUncertainty } from "./types.ts";
 import { classifyTask } from "./task-classification.ts";
 import { routeTask } from "./role-router.ts";
 import { DependencyGraph } from "./dependency-graph.ts";
@@ -146,7 +146,6 @@ export function applyRoadmapEdit(state: ShipState, edit: RoadmapEdit): void {
   state.milestones = plan;
   state.roadmapRevision++;
   if (edit.type === "add") {
-    state.reviewedSlices = (state.reviewedSlices ?? []).filter(key => key !== edit.slice);
     if (state.phase === "complete") state.phase = "idle";
   }
 }
@@ -155,31 +154,4 @@ export function refresh(state: ShipState): void {
     for (const s of m.slices) s.status = s.tasks.every(t => t.status === "passed") ? "complete" : s.tasks.some(t => t.attempts > 0) ? "active" : "pending";
     m.status = m.slices.every(s => s.status === "complete") ? "complete" : m.slices.some(s => s.status !== "pending") ? "active" : "pending";
   }
-}
-export function applyReview(state: ShipState, output: string, source: string): Review {
-  const raw: unknown = JSON.parse(output); object(raw);
-  if (raw.revision !== state.roadmapRevision) throw new Error("Stale roadmap revision");
-  text(raw.rationale, "review rationale");
-  if (!Array.isArray(raw.changes) || !Array.isArray(raw.lessons) || raw.lessons.length > 10 || raw.changes.length > 20) throw new Error("Invalid review collections");
-  const seen = new Set<string>();
-  for (const c of raw.changes) {
-    object(c); text(c.task, "task key"); text(c.goal, "goal"); text(c.reason, "reason");
-    if (Object.keys(c).some(k => !["task", "goal", "reason"].includes(k))) throw new Error("Review cannot change acceptance, commands, IDs, or status");
-    const entry = tasks(state).find(t => t.key === c.task);
-    if (!entry || entry.t.status !== "pending" || entry.t.attempts !== 0 || seen.has(c.task)) throw new Error("Review target must be a unique, unstarted task");
-    seen.add(c.task);
-  }
-  for (const l of raw.lessons) {
-    object(l); text(l.text, "lesson"); text(l.evidence, "evidence");
-    if (!["observation", "decision", "assumption", "lesson"].includes(String(l.kind))) throw new Error("Invalid knowledge kind");
-  }
-  const review = raw as unknown as Review;
-  for (const change of review.changes) {
-    const task = tasks(state).find(t => t.key === change.task)!.t;
-    Object.assign(task, taskMetadata({ ...task, goal: change.goal, objective: change.goal, complexity: undefined, risk: undefined, classificationSignals: undefined, classificationRationale: undefined, parallelEligible: undefined, executionRoute: undefined, execution: undefined, verificationPlan: undefined }, false, state.repoChecks));
-  }
-  state.knowledge ??= [];
-  for (const lesson of review.lessons) state.knowledge.push({ ...lesson, id: `K${String(state.knowledge.length + 1).padStart(4, "0")}`, source: "agent", evidence: `${source}: ${lesson.evidence}`, at: new Date().toISOString() });
-  if (review.changes.length) state.roadmapRevision++;
-  return review;
 }

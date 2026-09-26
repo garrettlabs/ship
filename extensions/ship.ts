@@ -2,6 +2,8 @@ import { access, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { loadState, queueMessage, queueRoadmapEdit } from "../src/store.ts";
+import { initialize } from "../src/project.ts";
+import { recoverLock } from "../src/lock.ts";
 import { reportNativeOutcome, routeNativeSpawn, startNativeRun, submitNativePlan, type NativeOutcome } from "../src/native-execution.ts";
 import type { RoadmapEdit } from "../src/types.ts";
 
@@ -28,7 +30,7 @@ function isNativeOutcome(value: unknown): value is NativeOutcome {
     typeof value.summary === "string";
 }
 
-const help = "Ship commands: /ship status (project and roadmap); /ship run (dispatch native OMP tasks); /ship pause and /ship resume (queue safe-boundary controls); /ship add (queue a fully planned task); /ship change (queue an unstarted goal and planning hints). Queued requests take effect only at a safe boundary.";
+const help = "Ship commands: /ship init (initialize from a project brief); /ship run (trigger native OMP planning and task dispatch); /ship add and /ship change (queue safe-boundary roadmap edits); /ship status (inspect persisted progress); /ship pause and /ship resume (safe-boundary stop/recovery); /ship recover (clear a confirmed-dead SHIP lock). OMP owns agents and sessions.";
 
 export function createShipExtension() {
   return (api: ExtensionAPI): void => {
@@ -86,18 +88,35 @@ export function createShipExtension() {
       },
     });
     api.registerCommand("ship", {
-      description: "Inspect and control the Ship project (/ship for help)",
+      description: "Initialize and manage native Ship project planning (/ship for help)",
       async handler(args: string, ctx: ExtensionCommandContext): Promise<void> {
         const action = args.trim() || "help";
         if (action === "help") { ctx.ui.notify(help, "info"); return; }
-        if (!["status", "run", "pause", "resume", "add", "change"].includes(action)) {
+        if (!["init", "status", "run", "pause", "resume", "recover", "add", "change"].includes(action)) {
           ctx.ui.notify(`Unknown Ship command: ${action}. ${help}`, "error"); return;
         }
-        if (["run", "add", "change"].includes(action) && !ctx.hasUI) {
+        if (["init", "run", "recover", "add", "change"].includes(action) && !ctx.hasUI) {
           ctx.ui.notify(`/ship ${action} requires an interactive UI.`, "error"); return;
         }
         try {
+          if (action === "init") {
+            if (ctx.agent.kind !== "main") throw new Error("Initialize SHIP from the main OMP session");
+            const brief = await ctx.ui.input("Project brief", "Path to a nonempty brief file in this checkout");
+            if (brief === undefined) return;
+            if (!brief.trim()) throw new Error("Project brief path cannot be empty");
+            const root = await realpath(ctx.cwd);
+            if (!await ctx.ui.confirm("Initialize SHIP?", `Use ${brief.trim()} as the project brief in ${root}? Existing .ship state will not be overwritten.`)) return;
+            await initialize(root, brief.trim());
+            ctx.ui.notify("SHIP initialized. Use /ship run to plan and dispatch tasks in this OMP session.", "info");
+            return;
+          }
           const root = await projectRoot(ctx.cwd);
+          if (action === "recover") {
+            if (!await ctx.ui.confirm("Recover SHIP lock?", "Only recover after confirming the former OMP session is dead. Recovery will refuse a live lock owner.")) return;
+            await recoverLock(root);
+            ctx.ui.notify("Dead SHIP lock cleared. Use /ship run to reconcile persisted assignments.", "info");
+            return;
+          }
           if (action === "status") {
             const s = await loadState(root);
             const taskCount = s.milestones.reduce((count, milestone) => count + milestone.slices.reduce((n, slice) => n + slice.tasks.length, 0), 0);
@@ -154,7 +173,7 @@ export function createShipExtension() {
               else Object.assign(hints, { [flag === "--depends" ? "dependencies" : flag === "--files" ? "affectedFiles" : "affectedDomains"]: value === "-" ? [] : value.split(",").map(part => part.trim()) });
             }
           }
-          if (!await ctx.ui.confirm(`${action === "add" ? "Queue new task" : "Queue goal change"} for ${id}?`, `Roadmap r${s.roadmapRevision}. This request will be applied at a controller safe boundary only if the revision is still current.`)) return;
+          if (!await ctx.ui.confirm(`${action === "add" ? "Queue new task" : "Queue goal change"} for ${id}?`, `Roadmap r${s.roadmapRevision}. This request will be applied at a SHIP safe boundary only if the revision is still current.`)) return;
           const edit = action === "add"
             ? { type: "add", slice: id, title: values[0], goal: values[1], acceptance: values[2], check: values[3], revision: s.roadmapRevision, ...hints }
             : { type: "change", task: id, goal: values[0], revision: s.roadmapRevision, ...hints };

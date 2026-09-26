@@ -67,20 +67,10 @@ export interface ShipState {
   lastHead?: string; partialTree?: string; activeAttempt?: Attempt; dispatches?: number; planningFailures?: number;
   nativeBatch?: NativeBatch;
   nativePlanning?: NativePlanning;
-  reviewedSlices?: string[]; reviewAttempts?: Record<string, number>;
   knowledge?: Knowledge[]; processedInbox?: string[];
 }
 export interface ShipConfig {
   schemaVersion: 1;
-  worker: { command: string; args: string[]; startupTimeoutMs: number; inactivityTimeoutMs: number; hardTimeoutMs: number };
   limits: { maxTaskAttempts: number; maxDispatches: number };
-  verificationTimeoutMs?: number; protectedChecks?: string[]; review?: boolean;
-}
-export interface WorkerResult { ok: boolean; text: string; error?: string; retryable?: boolean; }
-export interface WorkerOptions { controlRoot?: string; signal?: AbortSignal; logFile?: string; }
-export interface Worker { run(prompt: string, cwd: string, options?: WorkerOptions): Promise<WorkerResult>; }
-export interface Review {
-  revision: number; rationale: string;
-  lessons: { kind: "observation" | "decision" | "assumption" | "lesson"; text: string; evidence: string }[];
-  changes: { task: string; goal: string; reason: string }[];
+  verificationTimeoutMs?: number; protectedChecks?: string[];
 }
