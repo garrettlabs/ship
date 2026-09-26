@@ -1,130 +1,63 @@
 import { createHash } from "node:crypto";
-import type { Addition, AdditionProposal, InboxMessage, Milestone, NewMilestone, NewSlice, NewTask, ShipState, Slice, Task, WorkOrigin, WorkProposal, WorkRequest } from "./types.ts";
-import { refresh, strings, tasks, validatePlan } from "./model.ts";
+import type { Addition, InboxMessage, NewSlice, NewTask, ProposalPayload, ShipState, WorkOrigin, WorkProposal, WorkRequest } from "./types.ts";
+import { refresh, validatePlan } from "./model.ts";
+import { addToRoadmap, addition, exact, nodeId, record, text } from "./patches.ts";
+import { canonical, changedState, changeContext, changeSet } from "./change.ts";
 
-function record(x: unknown): asserts x is Record<string, unknown> {
-  if (!x || typeof x !== "object" || Array.isArray(x)) throw new Error("Expected an object");
+export function proposalId(p: ProposalPayload): string { return `P${createHash("sha256").update(canonical(p)).digest("hex")}`; }
+function payload(p: WorkProposal): ProposalPayload {
+  return { revision: p.revision, requestId: p.requestId, rationale: p.rationale, patch: p.patch,
+    ...(p.context ? { context: p.context } : {}), ...(p.preview ? { preview: p.preview } : {}) };
 }
-function exact(x: Record<string, unknown>, keys: string[]) {
-  if (Object.keys(x).some(k => !keys.includes(k))) throw new Error("Unsupported proposal field; additions cannot edit existing work");
-}
-function text(x: unknown, name: string, limit = 20_000): asserts x is string {
-  if (typeof x !== "string" || !x.trim() || x.length > limit) throw new Error(`Invalid ${name}`);
-}
-function nodeId(x: unknown, prefix: string): asserts x is string {
-  if (typeof x !== "string" || !new RegExp(`^${prefix}[0-9]{2,}$`).test(x) || x.length > 12) throw new Error(`Invalid ${prefix} ID`);
-}
-function newTask(x: unknown): NewTask {
-  record(x); exact(x, ["id", "title", "goal", "acceptance", "verificationCommands", "dependsOn"]);
-  nodeId(x.id, "T"); text(x.title, "task title", 1000); text(x.goal, "goal");
-  strings(x.acceptance, "acceptance", true); strings(x.verificationCommands, "verificationCommands", true);
-  for (const list of [x.acceptance, x.verificationCommands]) {
-    if (list.length > 20) throw new Error("Too many acceptance checks");
-    for (const line of list) text(line, "acceptance check", 8000);
-  }
-  if (x.dependsOn !== undefined) strings(x.dependsOn, "dependsOn");
-  return { id: x.id, title: x.title, goal: x.goal, acceptance: [...x.acceptance], verificationCommands: [...x.verificationCommands], ...(x.dependsOn === undefined ? {} : { dependsOn: [...x.dependsOn] }) };
-}
-function newSlice(x: unknown): NewSlice {
-  record(x); exact(x, ["id", "title", "tasks"]); nodeId(x.id, "S"); text(x.title, "slice title", 1000);
-  if (!Array.isArray(x.tasks) || !x.tasks.length || x.tasks.length > 10) throw new Error("A new slice needs 1–10 tasks");
-  return { id: x.id, title: x.title, tasks: x.tasks.map(newTask) };
-}
-function newMilestone(x: unknown): NewMilestone {
-  record(x); exact(x, ["id", "title", "outcome", "slices"]); nodeId(x.id, "M"); text(x.title, "milestone title", 1000); text(x.outcome, "outcome");
-  if (!Array.isArray(x.slices) || !x.slices.length || x.slices.length > 5) throw new Error("A new milestone needs 1–5 slices");
-  return { id: x.id, title: x.title, outcome: x.outcome, slices: x.slices.map(newSlice) };
-}
-function addition(x: unknown): Addition {
-  record(x);
-  if (x.after !== null) text(x.after, "insertion anchor", 12);
-  const after = x.after as string | null;
-  if (x.type === "ADD_TASK") {
-    exact(x, ["type", "parent", "after", "task"]); text(x.parent, "parent", 25);
-    return { type: x.type, parent: x.parent, after, task: newTask(x.task) };
-  }
-  if (x.type === "ADD_SLICE") {
-    exact(x, ["type", "parent", "after", "slice"]); text(x.parent, "parent", 12);
-    return { type: x.type, parent: x.parent, after, slice: newSlice(x.slice) };
-  }
-  if (x.type === "ADD_MILESTONE") {
-    exact(x, ["type", "after", "milestone"]);
-    return { type: x.type, after, milestone: newMilestone(x.milestone) };
-  }
-  throw new Error("Only ADD_TASK, ADD_SLICE, and ADD_MILESTONE are supported");
-}
-function canonical(x: unknown): string {
-  if (Array.isArray(x)) return `[${x.map(canonical).join(",")}]`;
-  if (x && typeof x === "object") return `{${Object.entries(x).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
-  return JSON.stringify(x);
-}
-export function proposalId(p: AdditionProposal): string { return `P${createHash("sha256").update(canonical(p)).digest("hex")}`; }
-function payload(p: WorkProposal): AdditionProposal { return { revision: p.revision, requestId: p.requestId, rationale: p.rationale, patch: p.patch }; }
-function insert<T extends { id: string }>(items: T[], node: T, after: string | null) {
-  if (items.some(x => x.id === node.id)) throw new Error(`Duplicate ID: ${node.id}`);
-  const anchor = after === null ? -1 : items.findIndex(x => x.id === after);
-  if (after !== null && anchor < 0) throw new Error(`Missing insertion anchor: ${after}`);
-  items.splice(anchor + 1, 0, node);
-}
-function proposedRoadmap(s: ShipState, p: AdditionProposal, origin: WorkOrigin): Milestone[] {
+function proposed(s: ShipState, p: ProposalPayload, origin: WorkOrigin, project?: string) {
   if (s.activeAttempt) throw new Error("Wait for active attempt reconciliation before changing the roadmap");
   if (p.revision !== s.roadmapRevision) throw new Error("Stale roadmap revision; reject and submit a fresh request");
-  const copy = structuredClone(s.milestones), patch = p.patch;
-  const task = (n: NewTask): Task => ({ ...structuredClone(n), status: "pending", attempts: 0, requestedBy: origin });
-  const slice = (n: NewSlice): Slice => ({ id: n.id, title: n.title, status: "pending", tasks: n.tasks.map(task), requestedBy: origin });
-  if (patch.type === "ADD_TASK") {
-    const [mid, sid, extra] = patch.parent.split("/");
-    const m = copy.find(x => x.id === mid), parent = m?.slices.find(x => x.id === sid);
-    if (!parent || extra !== undefined) throw new Error("Missing parent slice");
-    if (parent.tasks.every(t => t.status === "passed")) throw new Error("Completed slice is history; add a follow-up slice or milestone");
-    insert(parent.tasks, task(patch.task), patch.after);
-  } else if (patch.type === "ADD_SLICE") {
-    const parent = copy.find(x => x.id === patch.parent);
-    if (!parent) throw new Error("Missing parent milestone");
-    if (parent.slices.every(x => x.tasks.every(t => t.status === "passed"))) throw new Error("Completed milestone is history; add a follow-up milestone");
-    insert(parent.slices, slice(patch.slice), patch.after);
-  } else {
-    insert(copy, { id: patch.milestone.id, title: patch.milestone.title, outcome: patch.milestone.outcome, status: "pending", slices: patch.milestone.slices.map(slice), requestedBy: origin }, patch.after);
+  if (p.patch.type === "CHANGE") {
+    if (project === undefined || !p.context || canonical(p.context) !== canonical(changeContext(s, project))) throw new Error("Stale change context (brief, requirements, or roadmap changed); reject and resubmit");
+    const result = changedState(s, p.patch, origin, project);
+    if (canonical(p.preview) !== canonical(result.preview)) throw new Error("Change preview no longer matches current work");
+    return result;
   }
-  validatePlan(copy);
-  const existing = new Set(tasks(s).map(x => x.key));
-  let sawNew = false;
-  for (const entry of tasks({ ...s, milestones: copy })) {
-    if (!existing.has(entry.key)) sawNew = true;
-    else if (sawNew && (entry.t.attempts > 0 || entry.t.status !== "pending")) throw new Error("Cannot insert before started or completed work");
-  }
-  return copy;
+  const milestones = addToRoadmap(s, p.patch, origin); validatePlan(milestones);
+  return { milestones, requirements: s.requirements ?? [], requirementsBaseHash: s.requirementsBaseHash };
 }
-export function parseWorkProposal(s: ShipState, request: WorkRequest, output: string): WorkProposal | { conflict: string } {
+export function parseWorkProposal(s: ShipState, request: WorkRequest, output: string, project?: string): WorkProposal | { conflict: string } {
   if (output.length > 128_000) throw new Error("Proposal exceeds 128,000 characters");
   const raw: unknown = JSON.parse(output); record(raw);
   if (raw.revision !== s.roadmapRevision || raw.requestId !== request.id) throw new Error("Stale revision or mismatched request ID");
   if ("conflict" in raw) { exact(raw, ["revision", "requestId", "conflict"]); text(raw.conflict, "conflict"); return { conflict: raw.conflict }; }
   exact(raw, ["revision", "requestId", "rationale", "patch"]); text(raw.rationale, "rationale");
-  const p: AdditionProposal = { revision: s.roadmapRevision, requestId: request.id, rationale: raw.rationale, patch: addition(raw.patch) };
+  const isChange = request.kind === "change";
+  const patch = isChange ? changeSet(raw.patch) : addition(raw.patch);
+  const p: ProposalPayload = { revision: s.roadmapRevision, requestId: request.id, rationale: raw.rationale, patch };
+  if (patch.type === "CHANGE") {
+    if (project === undefined) throw new Error("Change planning requires the current project brief");
+    p.context = changeContext(s, project);
+    p.preview = changedState(s, patch, { source: "user", requestId: request.id, proposalId: "P" + "0".repeat(64) }, project).preview;
+  }
   const id = proposalId(p);
-  proposedRoadmap(s, p, { source: "user", requestId: request.id, proposalId: id });
+  proposed(s, p, { source: "user", requestId: request.id, proposalId: id }, project);
   return { ...p, id };
 }
-export function applyWorkProposal(s: ShipState, request: WorkRequest): void {
+export function applyWorkProposal(s: ShipState, request: WorkRequest, project?: string): void {
   const p = request.proposal;
-  if (request.status !== "proposed" || !p || p.id !== proposalId(payload(p))) throw new Error("No valid pending proposal");
+  if (request.status !== "proposed" || !p || p.requestId !== request.id || (request.kind === "change") !== (p.patch.type === "CHANGE") || p.id !== proposalId(payload(p))) throw new Error("No valid pending proposal");
   if (s.phase === "blocked") throw new Error("Controller is blocked; resolve the blocker before approval");
   const origin: WorkOrigin = { source: "user", requestId: request.id, proposalId: p.id };
-  const roadmap = proposedRoadmap(s, payload(p), origin);
+  const next = proposed(s, payload(p), origin, project);
   // All validation precedes mutation. The caller persists plan + receipt together.
-  s.milestones = roadmap; s.roadmapRevision++;
+  s.milestones = next.milestones; s.requirements = next.requirements; s.requirementsBaseHash = next.requirementsBaseHash; s.roadmapRevision++;
   request.status = "applied"; request.appliedRevision = s.roadmapRevision;
   request.resolvedAt = new Date().toISOString(); delete request.error;
   if (s.phase === "complete" || s.phase === "waiting") s.phase = "idle";
   refresh(s);
 }
-export function consumeWorkMessage(s: ShipState, msg: InboxMessage, file: string): boolean {
+export function consumeWorkMessage(s: ShipState, msg: InboxMessage, file: string, project?: string): boolean {
   s.workRequests ??= [];
-  if (msg.type === "add") {
+  if (msg.type === "add" || msg.type === "change") {
     text(msg.note, "work request");
     const next = Math.max(0, ...s.workRequests.map(r => Number(r.id.slice(1)))) + 1;
-    s.workRequests.push({ id: `W${String(next).padStart(4, "0")}`, text: msg.note, source: "user", inboxId: file, createdAt: msg.at, status: "queued", attempts: 0 });
+    s.workRequests.push({ id: `W${String(next).padStart(4, "0")}`, kind: msg.type, text: msg.note, source: "user", inboxId: file, createdAt: msg.at, status: "queued", attempts: 0 });
     return true;
   }
   const request = s.workRequests.find(r => r.id === msg.requestId);
@@ -139,15 +72,21 @@ export function consumeWorkMessage(s: ShipState, msg: InboxMessage, file: string
     request.error = "Approval did not match a pending proposal; inspect before approving again"; return true;
   }
   if (s.phase === "blocked") { request.error = "Approval deferred by a controller blocker; resolve it and approve again"; return true; }
-  try { applyWorkProposal(s, request); }
+  try { applyWorkProposal(s, request, project); }
   catch (error) { request.status = "stale"; request.error = String(error); }
   return true;
 }
-export function invalidateWorkProposals(s: ShipState): boolean {
+export function invalidateWorkProposals(s: ShipState, project?: string): boolean {
   let changed = false;
   for (const r of s.workRequests ?? []) {
     if (r.status !== "proposed" || !r.proposal || s.activeAttempt) continue;
-    try { proposedRoadmap(s, r.proposal, { source: "user", requestId: r.id, proposalId: r.proposal.id }); }
+    // Calls that only persist a transition have no raw brief. Check the plan
+    // now; full brief/precondition validation also runs at inbox application.
+    try {
+      if (r.proposal.patch.type === "CHANGE" && project === undefined) {
+        if (r.proposal.revision !== s.roadmapRevision || r.proposal.context?.roadmapHash !== changeContext(s, "").roadmapHash) throw new Error("Stale roadmap revision or plan");
+      } else proposed(s, r.proposal, { source: "user", requestId: r.id, proposalId: r.proposal.id }, project);
+    }
     catch (error) { r.status = "stale"; r.error = String(error); changed = true; }
   }
   return changed;
@@ -158,21 +97,29 @@ export function validateWorkRequests(value: unknown): asserts value is WorkReque
   for (const r of value) {
     record(r); nodeId(r.id, "W"); text(r.text, "work request"); text(r.inboxId, "inbox provenance"); text(r.createdAt, "request date");
     if (r.source !== "user" || ids.has(r.id) || !Number.isSafeInteger(r.attempts) || (r.attempts as number) < 0 || !["queued", "planning", "proposed", "applied", "rejected", "conflict", "failed", "stale"].includes(String(r.status))) throw new Error("Invalid work request state");
+    if (r.kind !== undefined && r.kind !== "add" && r.kind !== "change") throw new Error("Invalid request kind");
     ids.add(r.id);
     if (r.status === "proposed" || r.status === "applied" || r.proposal !== undefined) {
       record(r.proposal); const p = r.proposal;
       if (p.requestId !== r.id || !Number.isSafeInteger(p.revision) || (p.revision as number) < 0) throw new Error("Invalid proposal identity");
       text(p.rationale, "rationale");
-      const parsed: AdditionProposal = { requestId: r.id, revision: p.revision as number, rationale: p.rationale, patch: addition(p.patch) };
+      const parsed: ProposalPayload = { requestId: r.id, revision: p.revision as number, rationale: p.rationale, patch: r.kind === "change" ? changeSet(p.patch) : addition(p.patch) };
+      if (parsed.patch.type === "CHANGE") {
+        record(p.context); exact(p.context, ["projectHash", "roadmapHash", "requirementsHash"]);
+        for (const key of ["projectHash", "roadmapHash", "requirementsHash"]) if (!/^[0-9a-f]{64}$/.test(String(p.context[key]))) throw new Error("Invalid change precondition");
+        if (!Array.isArray(p.preview) || p.preview.some(v => typeof v !== "string")) throw new Error("Invalid change preview");
+        parsed.context = p.context as unknown as NonNullable<ProposalPayload["context"]>; parsed.preview = p.preview as string[];
+      } else if (p.context !== undefined || p.preview !== undefined) throw new Error("Unexpected addition context");
       if (p.id !== proposalId(parsed)) throw new Error("Proposal content does not match its approval fingerprint");
     }
   }
 }
 export function describeRequest(r: WorkRequest): string[] {
-  const lines = [`${r.id} [${r.status}] ${r.text}`, `Source: user | planning attempts: ${r.attempts}`];
+  const lines = [`${r.id} [${r.status}] ${r.text}`, `Source: user | ${r.kind ?? "add"} request | planning attempts: ${r.attempts}`];
   if (r.error) lines.push(`Notice: ${r.error}`);
   if (!r.proposal) return lines;
   const p = r.proposal, patch = p.patch;
+  if (patch.type === "CHANGE") return [...lines, `CHANGE | roadmap r${p.revision}`, `Reason: ${p.rationale}`, ...(p.preview ?? []), `Proposal: ${p.id}`, "Approval authorizes exactly the displayed changes. Cancelled work is not passed; protectedChecks are unchanged."];
   lines.push(`${patch.type} | roadmap r${p.revision}`, `Reason: ${p.rationale}`, `Placement: ${"parent" in patch ? patch.parent : "project"}, after ${patch.after ?? "start"}`);
   const task = (t: NewTask) => {
     lines.push(`  ${t.id}: ${t.title}`, `    Goal: ${t.goal}`);

@@ -4,9 +4,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { ShipState, Worker, WorkerResult, WorkRequest } from "./types.ts";
 import { appendEvent, atomicJson, consumeInbox, loadConfig, loadState, readJson, saveState, shipDir, writeRoadmapView } from "./store.ts";
 import { candidateTree, clean, commitCandidate, ensureWorkspace, head, matchesCommit } from "./git.ts";
-import { executorPrompt, plannerPrompt, reviewPrompt, workPlannerPrompt } from "./prompts.ts";
-import { applyReview, parsePlan, refresh, tasks } from "./model.ts";
+import { executorPrompt, plannerPrompt, reviewPrompt, workPlannerPrompt, changePlannerPrompt } from "./prompts.ts";
+import { applyReview, parsePlan, refresh, tasks, terminal } from "./model.ts";
 import { invalidateWorkProposals, parseWorkProposal } from "./work.ts";
+import { effectiveProject } from "./change.ts";
 import { acquireLock } from "./lock.ts";
 import { assertNoProcess, runCheck } from "./process.ts";
 
@@ -47,9 +48,10 @@ export class Controller {
   private async advance(): Promise<Step> {
     await assertNoProcess(this.root);
     const s = await loadState(this.root), config = await loadConfig(this.root);
+    const rawProject = await readFile(path.join(shipDir(this.root), "PROJECT.md"), "utf8");
     const revision = s.roadmapRevision;
-    const inboxChanged = await consumeInbox(this.root, s);
-    const invalidated = invalidateWorkProposals(s);
+    const inboxChanged = await consumeInbox(this.root, s, rawProject);
+    const invalidated = invalidateWorkProposals(s, rawProject);
     // Inbox additions/receipts and their generated views are visible even while
     // paused. Applying an approval does not itself authorize resuming execution.
     if (invalidated) await saveState(this.root, s);
@@ -60,7 +62,9 @@ export class Controller {
     await mkdir(path.join(shipDir(this.root), "logs"), { recursive: true });
     await mkdir(path.join(shipDir(this.root), "attempts"), { recursive: true });
     const cwd = await ensureWorkspace(this.root, s);
-    const project = await readFile(path.join(shipDir(this.root), "PROJECT.md"), "utf8");
+    let project: string;
+    try { project = effectiveProject(rawProject, s); }
+    catch (error) { return this.block(s, String(error)); }
     if (project.length > 60_000) return this.block(s, "Brief exceeds 60,000 characters; provide a focused project brief");
     if (s.activeAttempt) return this.reconcile(s, cwd);
     if (await head(cwd) !== (s.lastHead ?? s.workspace!.baseHead)) return this.block(s, "Unexpected worktree commit; inspect before continuing");
@@ -93,12 +97,12 @@ export class Controller {
     // Freeze at a safe boundary while a proposal is being reviewed. Otherwise
     // executing its intended parent could complete it and stale the proposal
     // before the user has a chance to approve. Captures never create this gate.
-    if (s.workRequests!.some(r => r.status === "proposed")) {
+    if (s.workRequests!.some(r => r.status === "proposed" || (r.kind === "change" && ["conflict", "failed", "stale"].includes(r.status)))) {
       if (s.phase !== "waiting") { s.phase = "waiting"; await this.persist(s, "work_awaiting_decision"); }
       return "waiting";
     }
     const request = s.workRequests!.find(r => r.status === "queued" || r.status === "planning");
-    if (request) return this.planWork(s, cwd, project, request);
+    if (request) return this.planWork(s, cwd, rawProject, request);
     refresh(s);
     for (const m of s.milestones) for (const slice of m.slices) {
       const key = `${m.id}/${slice.id}`;
@@ -111,7 +115,7 @@ export class Controller {
       await this.persist(s, "review_started", { slice: key });
       const baseline = await candidateTree(cwd);
       const summaries: string[] = [];
-      for (const t of slice.tasks) {
+      for (const t of slice.tasks.filter(t => t.status === "passed")) {
         const file = path.join(shipDir(this.root), "attempts", `${m.id}-${slice.id}-${t.id}-a${t.attempts}.result.json`);
         summaries.push((await readFile(file, "utf8")).slice(0, 4000));
       }
@@ -130,7 +134,7 @@ export class Controller {
       s.reviewedSlices!.push(key); s.phase = "idle";
       await this.persist(s, "roadmap_reassessed", { slice: key, revision: s.roadmapRevision }); return "progress";
     }
-    const next = tasks(s).find(x => x.t.status !== "passed");
+    const next = tasks(s).find(x => !terminal(x.t));
     if (!next) {
       if (s.workRequests!.some(r => r.status !== "applied" && r.status !== "rejected")) {
         if (s.phase !== "waiting") { s.phase = "waiting"; await this.persist(s, "work_awaiting_decision"); }
@@ -177,7 +181,7 @@ export class Controller {
     request.attempts++; request.status = "planning"; s.phase = "planning";
     await this.persist(s, "work_planning_started", { request: request.id, attempt: request.attempts });
     const baseline = await candidateTree(cwd), baseHead = await head(cwd);
-    const result = await this.invoke(s, workPlannerPrompt(project, s, request), cwd, `work-${request.id}-${request.attempts}`);
+    const result = await this.invoke(s, request.kind === "change" ? changePlannerPrompt(project, s, request, config.protectedChecks ?? []) : workPlannerPrompt(effectiveProject(project, s), s, request), cwd, `work-${request.id}-${request.attempts}`);
     if (await head(cwd) !== baseHead || await candidateTree(cwd) !== baseline) {
       request.status = "failed"; request.error = "Work planner modified source";
       return this.block(s, "Work planner modified source; changes preserved for inspection");
@@ -185,7 +189,7 @@ export class Controller {
     await atomicJson(path.join(shipDir(this.root), "attempts", `work-${request.id}-${request.attempts}.json`), result);
     try {
       if (!result.ok) throw new Error(result.error ?? "Work planner failed");
-      const proposal = parseWorkProposal(s, request, result.text);
+      const proposal = parseWorkProposal(s, request, result.text, project);
       if ("conflict" in proposal) { request.status = "conflict"; request.error = proposal.conflict; }
       else { request.status = "proposed"; request.proposal = proposal; delete request.error; }
     } catch (error) {

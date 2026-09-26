@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { InboxMessage, ShipConfig, ShipState } from "./types.ts";
 import { consumeWorkMessage, validateWorkRequests } from "./work.ts";
+import { effectiveProject, validateRequirements } from "./change.ts";
 import { strings, validatePlan } from "./model.ts";
 export const shipDir = (root: string) => path.join(root, ".ship");
 export const statePath = (root: string) => path.join(shipDir(root), "state.json");
@@ -23,18 +24,18 @@ export async function atomicJson(file: string, value: unknown): Promise<void> {
 export async function readJson<T>(file: string): Promise<T> { return JSON.parse(await readFile(file, "utf8")) as T; }
 export async function loadState(root: string): Promise<ShipState> {
   const s = await readJson<ShipState>(statePath(root));
-  if (s.schemaVersion !== 1 || !Array.isArray(s.milestones) || typeof s.paused !== "boolean" || !Number.isInteger(s.roadmapRevision)) throw new Error("Invalid state.json");
+  if (![1, 2].includes(s.schemaVersion) || !Array.isArray(s.milestones) || typeof s.paused !== "boolean" || !Number.isInteger(s.roadmapRevision)) throw new Error("Invalid state.json");
   if (s.milestones.length) {
     validatePlan(s.milestones);
     for (const m of s.milestones) for (const slice of m.slices) for (const t of slice.tasks) {
-      if (!["pending", "running", "verifying", "passed", "failed", "blocked"].includes(t.status) || !Number.isInteger(t.attempts) || t.attempts < 0) throw new Error("Invalid task state");
+      if (!["pending", "running", "verifying", "passed", "failed", "blocked", "cancelled"].includes(t.status) || !Number.isInteger(t.attempts) || t.attempts < 0) throw new Error("Invalid task state");
     }
   }
   s.knowledge ??= []; s.processedInbox ??= []; s.reviewedSlices ??= []; s.reviewAttempts ??= {}; s.dispatches ??= 0; s.planningFailures ??= 0;
-  s.workRequests ??= []; validateWorkRequests(s.workRequests);
+  s.workRequests ??= []; validateWorkRequests(s.workRequests); validateRequirements(s);
   return s;
 }
-export async function saveState(root: string, state: ShipState): Promise<void> { state.updatedAt = new Date().toISOString(); await atomicJson(statePath(root), state); }
+export async function saveState(root: string, state: ShipState): Promise<void> { state.schemaVersion = 2; state.updatedAt = new Date().toISOString(); await atomicJson(statePath(root), state); }
 export async function loadConfig(root: string): Promise<ShipConfig> {
   const c = await readJson<ShipConfig>(configPath(root));
   if (c.schemaVersion !== 1 || !c.worker?.command || !c.limits) throw new Error("Invalid config.json");
@@ -48,9 +49,9 @@ export async function loadConfig(root: string): Promise<ShipConfig> {
 export async function appendEvent(root: string, event: Record<string, unknown>): Promise<void> {
   await appendFile(path.join(shipDir(root), "events.jsonl"), JSON.stringify({ at: new Date().toISOString(), ...event }) + "\n", "utf8");
 }
-export async function queueMessage(root: string, type: "pause" | "resume" | "capture" | "add", note?: string): Promise<void> {
+export async function queueMessage(root: string, type: "pause" | "resume" | "capture" | "add" | "change", note?: string): Promise<void> {
   if (!await exists(statePath(root))) throw new Error("Run ship init first");
-  if ((type === "capture" || type === "add") && (!note?.trim() || note.length > 20_000)) throw new Error("Note must be 1–20,000 characters");
+  if ((type === "capture" || type === "add" || type === "change") && (!note?.trim() || note.length > 20_000)) throw new Error("Note must be 1–20,000 characters");
   const id = `${Date.now()}-${randomUUID()}`;
   await atomicJson(path.join(shipDir(root), "inbox", `${id}.json`), { id, type, note, at: new Date().toISOString() });
 }
@@ -64,7 +65,7 @@ export async function queueWorkDecision(root: string, type: "approve" | "reject"
   const id = `${Date.now()}-${randomUUID()}`;
   await atomicJson(path.join(shipDir(root), "inbox", `${id}.json`), { id, type, requestId, proposalId: r.proposal?.id, at: new Date().toISOString() });
 }
-export async function consumeInbox(root: string, state: ShipState): Promise<boolean> {
+export async function consumeInbox(root: string, state: ShipState, project?: string): Promise<boolean> {
   let changed = false;
   state.processedInbox ??= []; state.knowledge ??= [];
   const dir = path.join(shipDir(root), "inbox"); await mkdir(dir, { recursive: true });
@@ -74,8 +75,9 @@ export async function consumeInbox(root: string, state: ShipState): Promise<bool
     if (msg.type === "pause") state.paused = true;
     else if (msg.type === "resume") { state.paused = false; if (state.phase === "blocked") { state.phase = "idle"; delete state.blockedReason; } }
     else if (msg.type === "capture" && typeof msg.note === "string" && msg.note.trim()) state.knowledge.push({ id: `K${String(state.knowledge.length + 1).padStart(4, "0")}`, kind: "capture", text: msg.note, source: "user", evidence: `inbox/${file}`, at: msg.at });
-    else if (["add", "approve", "reject"].includes(msg.type)) {
-      if (!consumeWorkMessage(state, msg, file)) continue;
+    else if (["add", "change", "approve", "reject"].includes(msg.type)) {
+      if (msg.type === "approve" && state.workRequests?.find(r => r.id === msg.requestId)?.kind === "change" && project === undefined) project = await readFile(path.join(shipDir(root), "PROJECT.md"), "utf8");
+      if (!consumeWorkMessage(state, msg, file, project)) continue;
     } else throw new Error(`Invalid inbox message: ${file}`);
     state.processedInbox.push(file); changed = true;
   }
@@ -88,13 +90,19 @@ export async function writeRoadmapView(root: string, state: ShipState): Promise<
   const lines = ["# Roadmap (generated)", "", `Revision: ${state.roadmapRevision}`, ""];
   for (const m of state.milestones) {
     lines.push(`## ${m.id}: ${m.title} [${m.status}]`, "", m.outcome, "");
-    for (const s of m.slices) { lines.push(`### ${s.id}: ${s.title} [${s.status}]`, ""); for (const t of s.tasks) lines.push(`- [${t.status === "passed" ? "x" : " "}] ${t.id} — ${t.title} (${t.status})`, `  ${t.goal}`); }
+    for (const s of m.slices) { lines.push(`### ${s.id}: ${s.title} [${s.status}]`, ""); for (const t of s.tasks) lines.push(`- [${t.status === "passed" ? "x" : t.status === "cancelled" ? "-" : " "}] ${t.id} — ${t.title} (${t.status})`, `  ${t.goal}`); }
   }
   if (state.workRequests?.length) {
     lines.push("", "## User work requests", "");
-    for (const r of state.workRequests) lines.push(`- ${r.id} [${r.status}] ${r.text}${r.appliedRevision ? ` (applied in r${r.appliedRevision})` : ""}`);
+    for (const r of state.workRequests) lines.push(`- ${r.id} [${r.kind ?? "add"}; ${r.status}] ${r.text}${r.appliedRevision ? ` (applied in r${r.appliedRevision})` : ""}`);
   }
   const { writeFile } = await import("node:fs/promises");
   await writeFile(path.join(shipDir(root), "ROADMAP.md"), lines.join("\n") + "\n");
+  if (state.requirements?.length) {
+    let effective: string;
+    try { effective = effectiveProject(await readFile(path.join(shipDir(root), "PROJECT.md"), "utf8"), state); }
+    catch (error) { effective = `UNAVAILABLE: ${String(error)}`; }
+    await writeFile(path.join(shipDir(root), "PROJECT-EFFECTIVE.md"), "<!-- Generated; use ship change, do not edit this view. -->\n" + effective + "\n");
+  }
   await writeFile(path.join(shipDir(root), "KNOWLEDGE.md"), "# Knowledge (generated; agent entries are proposals, not user authorization)\n\n" + (state.knowledge ?? []).map(k => `## ${k.id} [${k.kind}; ${k.source}]\n${k.text}\n\nEvidence: ${k.evidence}\n`).join("\n"));
 }

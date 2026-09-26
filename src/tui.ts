@@ -18,10 +18,11 @@ export async function tail(file: string, bytes = 16_384): Promise<string> {
 export function renderDashboard(s: ShipState, activity: string[], width = 100, height = 30, view = "roadmap", offset = 0, footer?: string, selection = 0): string {
   width = Math.max(20, width); height = Math.max(10, height);
   const entries = tasks(s), passed = entries.filter(x => x.t.status === "passed").length;
+  const cancelled = entries.filter(x => x.t.status === "cancelled").length;
   const current = entries.find(x => x.key === `${s.current?.milestoneId}/${s.current?.sliceId}/${s.current?.taskId}`);
   const lines = [
     `SHIP  |  ${s.projectName}  |  ${s.paused ? "PAUSED" : s.phase.toUpperCase()}`,
-    `${passed}/${entries.length} tasks  |  ${s.dispatches ?? 0} dispatches  |  roadmap r${s.roadmapRevision}`,
+    `${passed}/${entries.length} passed (${cancelled} cancelled)  |  ${s.dispatches ?? 0} dispatches  |  roadmap r${s.roadmapRevision}`,
     `Worktree: ${s.workspace?.branch ?? "not started"}`,
     `Current: ${current ? `${current.key} - ${current.t.title} (attempt ${current.t.attempts})` : "none"}`,
     s.blockedReason ? `BLOCKED: ${s.blockedReason}` : `Last accepted progress: ${s.lastProgressAt}`,
@@ -32,16 +33,16 @@ export function renderDashboard(s: ShipState, activity: string[], width = 100, h
   else if (view === "activity") rows = activity;
   else if (view === "requests") {
     const all = s.workRequests ?? [], selected = all[Math.min(selection, Math.max(0, all.length - 1))];
-    rows = selected ? [`Request ${Math.min(selection + 1, all.length)}/${all.length} | left/right selects | y approves | x rejects`, ...describeRequest(selected)] : ["No work requests yet. Press a to describe new work; s starts the controller."];
+    rows = selected ? [`Request ${Math.min(selection + 1, all.length)}/${all.length} | left/right selects | y approves | x rejects`, ...describeRequest(selected)] : ["No work requests yet. Press a to add or e to change work; s starts the controller."];
     // Unlike the roadmap, proposal detail must not hide long shell commands
     // behind truncation. Wrap every line; arrow keys reveal the full proposal.
     rows = rows.flatMap(line => { const chars = Array.from(safe(line)); const lines: string[] = []; do { lines.push(chars.splice(0, width).join("")); } while (chars.length); return lines; });
   }
   else for (const m of s.milestones) {
-    rows.push(`${m.status === "complete" ? "[x]" : "[ ]"} ${m.id} ${m.title}`);
+    rows.push(`${m.status === "cancelled" ? "[-]" : m.status === "complete" ? "[x]" : "[ ]"} ${m.id} ${m.title}`);
     for (const slice of m.slices) {
-      rows.push(`  ${slice.status === "complete" ? "[x]" : "[ ]"} ${slice.id} ${slice.title}`);
-      for (const t of slice.tasks) rows.push(`    ${t.status === "passed" ? "[x]" : t.status === "failed" ? "[!]" : t.status === "running" || t.status === "verifying" ? "[>]" : "[ ]"} ${t.id} ${t.title}`);
+      rows.push(`  ${slice.status === "cancelled" ? "[-]" : slice.status === "complete" ? "[x]" : "[ ]"} ${slice.id} ${slice.title}`);
+      for (const t of slice.tasks) rows.push(`    ${t.status === "cancelled" ? "[-]" : t.status === "passed" ? "[x]" : t.status === "failed" ? "[!]" : t.status === "running" || t.status === "verifying" ? "[>]" : "[ ]"} ${t.id} ${t.title}`);
     }
   }
   if (!rows.length) rows.push(view === "roadmap" ? "No roadmap yet. Press s to start the controller." : "No records yet.");
@@ -53,13 +54,13 @@ export function renderDashboard(s: ShipState, activity: string[], width = 100, h
     if (split) { const left = Math.floor(width * 0.52); const right = i === 0 ? "RECENT ACTIVITY" : activity.slice(-(bodyHeight - 1))[i - 1] ?? ""; lines.push(`${fit(visible[i] ?? "", left)} | ${right}`); }
     else lines.push(visible[i] ?? "");
   }
-  lines.push("-".repeat(width), "[s] start  [p] pause  [r] resume  [c] capture  [a] add  [q] detach", footer ?? `[1] roadmap  [2] knowledge  [3] activity  [4] requests  [arrows] scroll  | ${view}`);
+  lines.push("-".repeat(width), "[s] start  [p] pause  [r] resume  [c] capture  [a] add  [e] change  [q] detach", footer ?? `[1] roadmap  [2] knowledge  [3] activity  [4] requests  [arrows] scroll  | ${view}`);
   return lines.map(line => fit(line, width)).join("\n");
 }
 export async function tui(root: string, start: () => Promise<string>): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("TUI requires an interactive terminal; use ship status --json");
   await loadState(root);
-  let view = "roadmap", offset = 0, selection = 0, note: string | undefined, noteType: "capture" | "add" = "capture";
+  let view = "roadmap", offset = 0, selection = 0, note: string | undefined, noteType: "capture" | "add" | "change" = "capture";
   let notice = "", drawing = false, closed = false, busy = false;
   let displayed: WorkRequest | undefined;
   let confirming: { type: "approve" | "reject"; id: string; proposalId?: string } | undefined;
@@ -72,7 +73,7 @@ export async function tui(root: string, start: () => Promise<string>): Promise<v
       const records = (await tail(path.join(shipDir(root), "events.jsonl"))).split("\n").filter(Boolean);
       const activity = records.flatMap(line => { try { const e = JSON.parse(line); return [`${String(e.at).slice(11, 19)} ${e.type} ${e.task ?? e.slice ?? e.request ?? e.reason ?? ""}`]; } catch { return []; } });
       selection = Math.min(selection, Math.max(0, (s.workRequests?.length ?? 0) - 1));
-      const footer = note !== undefined ? `${noteType === "add" ? "Add work" : "Capture"} (Enter submits; Esc cancels): ${note}` : confirming ? `Confirm ${confirming.type} ${confirming.id}? y confirms; Esc cancels. Review all checks first.` : notice || undefined;
+      const footer = note !== undefined ? `${noteType === "add" ? "Add work" : noteType === "change" ? "Change work" : "Capture"} (Enter submits; Esc cancels): ${note}` : confirming ? `Confirm ${confirming.type} ${confirming.id}? y confirms; Esc cancels. Review all checks first.` : notice || undefined;
       if (!closed) {
         process.stdout.write("\x1b[H" + renderDashboard(s, activity, (process.stdout.columns ?? 100) - 1, process.stdout.rows ?? 30, view, offset, footer, selection));
         displayed = view === "requests" ? s.workRequests?.[selection] : undefined;
@@ -94,12 +95,12 @@ export async function tui(root: string, start: () => Promise<string>): Promise<v
           }
         } else if (note !== undefined) {
           if (key.name === "escape") note = undefined;
-          else if (key.name === "return") { const text = note; note = undefined; busy = true; if (text.trim()) await queueMessage(root, noteType, text); notice = `${noteType === "add" ? "Work request" : "Capture"} queued. Start with s if no controller is running.`; if (noteType === "add") { view = "requests"; offset = 0; } }
+          else if (key.name === "return") { const text = note; note = undefined; busy = true; if (text.trim()) await queueMessage(root, noteType, text); notice = `${noteType === "capture" ? "Capture" : "Work request"} queued. Start with s if no controller is running.`; if (noteType !== "capture") { view = "requests"; offset = 0; } }
           else if (key.name === "backspace") note = Array.from(note).slice(0, -1).join("");
           else if (input && !key.ctrl && input !== "\x1b" && note.length < 20_000) note += safe(input);
         } else if (input === "q") return close();
         else if (input === "p" || input === "r") { await queueMessage(root, input === "p" ? "pause" : "resume"); notice = `${input === "p" ? "Pause" : "Resume"} queued. Start with s if no controller is running.`; }
-        else if (input === "c" || input === "a") { noteType = input === "a" ? "add" : "capture"; note = ""; notice = ""; }
+        else if (input === "c" || input === "a" || input === "e") { noteType = input === "a" ? "add" : input === "e" ? "change" : "capture"; note = ""; notice = ""; }
         else if (view === "requests" && (input === "y" || input === "x")) {
           if (!displayed) throw new Error("No request selected");
           if (input === "y" && displayed.status !== "proposed") throw new Error("Only a pending proposal can be approved");
