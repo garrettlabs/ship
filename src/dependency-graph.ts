@@ -120,7 +120,10 @@ function findCycle(nodes: GraphTask[], dependencies: ReadonlyMap<string, readonl
 function safeBoundary(task: Task): boolean {
   if (task.taskType === "migration" || task.taskType === "integration" || task.risk !== "LOW" || task.uncertainty !== "LOW") return false;
   if (task.classificationSignals.some(signal => ["migration/schema", "persisted data", "destructive operations"].includes(signal))) return false;
-  return !/\b(migrat(?:e|ing|ion|ions)|integrat(?:e|ion)|shared[- ]mutable|shared (?:state|data)|database|schema|data pipeline)\b/i.test([task.title, task.objective, task.goal, ...task.affectedDomains].join(" "));
+  return !/\b(migrat(?:e|ing|ion|ions)|integrat(?:e|ion)|shared[- ]mutable|shared (?:state|data)|database|schema|data pipeline)\b/i.test([
+    task.title, task.objective, task.goal, ...task.acceptance, ...task.verificationRequirements,
+    ...task.verificationCommands, ...task.affectedDomains, ...task.affectedFiles,
+  ].join(" "));
 }
 
 function disjointOwnership(left: Task, right: Task): boolean {

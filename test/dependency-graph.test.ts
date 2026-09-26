@@ -101,3 +101,42 @@ test("ambiguous ownership and migration work never become parallel candidates", 
   migration[0].slices[0].tasks[0].goal = "Migrating legacy files";
   assert.deepEqual(new DependencyGraph(migration).parallelCandidatePairs(), []);
 });
+
+test("shared-mutable acceptance excludes candidates despite disjoint file ownership", () => {
+  const milestones = planned([[], []], [["src/cache.ts"], ["src/ui.ts"]]);
+  const [cache] = milestones[0].slices[0].tasks;
+  cache.acceptance = ["Shared mutable cache state remains consistent across workers"];
+  assert.deepEqual(new DependencyGraph(milestones).parallelCandidatePairs(), []);
+});
+
+test("boundaries in verification and affected files exclude otherwise independent candidates", () => {
+  const milestones = planned([[], []], [["src/feature.ts"], ["src/ui.ts"]]);
+  const [feature] = milestones[0].slices[0].tasks;
+  const graph = new DependencyGraph(milestones);
+  assert.deepEqual(graph.parallelCandidatePairs().map(pair => ids(pair)), [["T01", "T02"]]);
+  feature.verificationRequirements = ["Check the integration boundary"];
+  assert.deepEqual(graph.parallelCandidatePairs(), []);
+  feature.verificationRequirements = ["Check the feature"];
+  feature.verificationCommands = ["echo 'migration boundary'"];
+  assert.deepEqual(graph.parallelCandidatePairs(), []);
+  feature.verificationCommands = ["echo 'feature checked'"];
+  feature.affectedFiles = ["src/shared-mutable/cache.ts"];
+  assert.deepEqual(graph.parallelCandidatePairs(), []);
+});
+
+test("same-file and parent ownership overlap excludes pairs but unrelated files remain eligible", () => {
+  const milestones = planned([[], [], [], []],
+    [["src/shared.ts"], ["src/shared.ts"], ["src"], ["lib/other.ts"]]);
+  assert.deepEqual(new DependencyGraph(milestones).parallelCandidatePairs().map(pair => ids(pair)),
+    [["T01", "T04"], ["T02", "T04"], ["T03", "T04"]]);
+});
+
+test("direct and transitive prerequisites are not candidate pairs", () => {
+  const milestones = planned([[], ["T01"], ["T02"], []]);
+  const graph = new DependencyGraph(milestones);
+  assert.deepEqual(graph.parallelCandidatePairs().map(pair => ids(pair)), [["T01", "T04"]]);
+  milestones[0].slices[0].tasks[0].status = "passed";
+  assert.deepEqual(graph.parallelCandidatePairs().map(pair => ids(pair)), [["T02", "T04"]]);
+  milestones[0].slices[0].tasks[1].status = "passed";
+  assert.deepEqual(graph.parallelCandidatePairs().map(pair => ids(pair)), [["T03", "T04"]]);
+});
