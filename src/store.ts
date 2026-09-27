@@ -1,8 +1,9 @@
-import { mkdir, readFile, rename, open, access, appendFile, readdir, unlink } from "node:fs/promises";
+import { mkdir, readFile, rename, open, access, appendFile, readdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { InboxMessage, RoadmapEdit, ShipConfig, ShipState } from "./types.ts";
-import { applyRoadmapEdit, normalizePlan, refresh, strings } from "./model.ts";
+import { applyRoadmapEdit, normalizePlan, refresh, strings, tasks } from "./model.ts";
+import { DependencyGraph } from "./dependency-graph.ts";
 export const shipDir = (root: string) => path.join(root, ".ship");
 export const statePath = (root: string) => path.join(shipDir(root), "state.json");
 export const configPath = (root: string) => path.join(shipDir(root), "config.json");
@@ -73,7 +74,7 @@ export async function consumeInbox(root: string, state: ShipState): Promise<void
     else if (msg.type === "add" || msg.type === "change") {
       if (state.activeAttempt) continue;
       try {
-        const allowed = msg.type === "add" ? ["id", "type", "at", "slice", "title", "goal", "acceptance", "check", "revision"] : ["id", "type", "at", "task", "goal", "revision"];
+        const allowed = ["id", "type", "at", "goal", "revision", "taskType", "uncertainty", "dependencies", "affectedFiles", "affectedDomains", "verificationRequirements", ...(msg.type === "add" ? ["slice", "title", "acceptance", "check"] : ["task"])];
         if (Object.keys(msg).some(key => !allowed.includes(key))) throw new Error("Roadmap edit contains forbidden fields");
         applyRoadmapEdit(state, msg);
         refresh(state);
@@ -97,7 +98,38 @@ export async function writeRoadmapView(root: string, state: ShipState): Promise<
     lines.push(`## ${m.id}: ${m.title} [${m.status}]`, "", m.outcome, "");
     for (const s of m.slices) { lines.push(`### ${s.id}: ${s.title} [${s.status}]`, ""); for (const t of s.tasks) lines.push(`- [${t.status === "passed" ? "x" : " "}] ${t.id} — ${t.title} (${t.status})`, `  ${t.goal}`); }
   }
-  const { writeFile } = await import("node:fs/promises");
   await writeFile(path.join(shipDir(root), "ROADMAP.md"), lines.join("\n") + "\n");
+  const graph = state.milestones.length ? new DependencyGraph(state.milestones) : undefined;
+  const executionPlan = {
+    revision: state.roadmapRevision,
+    levels: graph?.levels.map(level => level.map(node => node.key)) ?? [],
+    tasks: tasks(state).map(({ key, t }) => ({
+      key, title: t.title, objective: t.objective, goal: t.goal, status: t.status,
+      taskType: t.taskType, complexity: t.complexity, risk: t.risk, uncertainty: t.uncertainty,
+      prerequisites: graph?.dependencies.get(key) ?? [], dependencyLevel: t.dependencyLevel,
+      ownership: { files: t.affectedFiles, domains: t.affectedDomains },
+      parallelEligible: t.parallelEligible, executionRoute: t.executionRoute,
+      classificationSignals: t.classificationSignals, classificationRationale: t.classificationRationale,
+      execution: t.execution, verificationRequirements: t.verificationRequirements, verificationCommands: t.verificationCommands,
+      verificationPlan: t.verificationPlan, acceptance: t.acceptance,
+    })),
+  };
+  await atomicJson(path.join(shipDir(root), "EXECUTION_PLAN.json"), executionPlan);
+  const planned = ["# Execution plan (generated)", "", `Roadmap revision: ${state.roadmapRevision}`, ""];
+  for (const item of executionPlan.tasks) {
+    planned.push(`## ${item.key}: ${item.title} [${item.status}]`, "",
+      `Objective: ${item.objective}`, `Goal: ${item.goal}`, `Type: ${item.taskType}; complexity: ${item.complexity}; risk: ${item.risk}; uncertainty: ${item.uncertainty}`,
+      `Dependency level: ${item.dependencyLevel}; prerequisites: ${item.prerequisites.join(", ") || "none"}`,
+      `Ownership: files ${item.ownership.files.join(", ") || "unspecified"}; domains ${item.ownership.domains.join(", ") || "unspecified"}`,
+      `Parallel eligible: ${item.parallelEligible}; execution route: ${item.executionRoute}`,
+      `Role: ${item.execution.role} (${item.execution.mode}); reason: ${item.execution.reason}`,
+      `Specialists: execution ${item.execution.specialist ?? "none"}; verification ${item.execution.verificationSpecialist ?? "none"}`,
+      `Classification signals: ${item.classificationSignals.join(", ") || "none"}; rationale: ${item.classificationRationale.join("; ")}`,
+      `Acceptance: ${item.acceptance.join("; ")}`,
+      `Verification requirements: ${item.verificationRequirements.join("; ")}`,
+      `Verification commands: ${item.verificationCommands.join("; ")}`,
+      `Verification policy: ${item.verificationPlan.requirements.map(r => `${r.kind}: ${r.reason}${r.command ? ` (${r.command})` : ""}`).join("; ")}`, "");
+  }
+  await writeFile(path.join(shipDir(root), "EXECUTION_PLAN.md"), planned.join("\n") + "\n");
   await writeFile(path.join(shipDir(root), "KNOWLEDGE.md"), "# Knowledge (generated; agent entries are proposals, not user authorization)\n\n" + (state.knowledge ?? []).map(k => `## ${k.id} [${k.kind}; ${k.source}]\n${k.text}\n\nEvidence: ${k.evidence}\n`).join("\n"));
 }

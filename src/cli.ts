@@ -46,7 +46,7 @@ export async function startDetached(root: string, args: string[] = []): Promise<
   } finally { await log.close(); }
 }
 function usage() {
-  console.log(`Ship 0.2 — file-backed autonomous controller\n\nship                         open the TUI\nship init --brief <file>      initialize without model calls\nship run [--once] [--detach] [--max-runtime 8h]\nship tui                     attach; q detaches without stopping the run\nship status [--json]\nship pause | resume          queue control at a safe boundary\nship capture "<note>"\nship add --slice M001/S01 --title TITLE --goal GOAL --acceptance TEXT --check COMMAND --revision N\nship change --task M001/S01/T01 --goal GOAL --revision N\nship recover                 unlock a confirmed-dead controller\nship doctor                  no paid model calls`);
+  console.log(`Ship 0.2 — file-backed autonomous controller\n\nship                         open the TUI\nship init --brief <file>      initialize without model calls\nship run [--once] [--detach] [--max-runtime 8h]\nship tui                     attach; q detaches without stopping the run\nship status [--json]\nship pause | resume          queue control at a safe boundary\nship capture "<note>"\nship add --slice M001/S01 --title TITLE --goal GOAL --acceptance TEXT --check COMMAND --revision N [planning hints]\nship change --task M001/S01/T01 --goal GOAL --revision N [planning hints]\nPlanning hints: --type TYPE --uncertainty LOW|MEDIUM|HIGH|UNKNOWN --depends TASK[,TASK] --files PATH[,PATH] --domains NAME[,NAME] --verify TEXT (use - to clear dependency/ownership lists)\nship recover                 unlock a confirmed-dead controller\nship doctor                  no paid model calls`);
 }
 export async function main(args: string[], root: string): Promise<void> {
   root = await realpath(root);
@@ -69,19 +69,30 @@ export async function main(args: string[], root: string): Promise<void> {
   } else if (command === "pause" || command === "resume" || command === "capture") {
     await queueMessage(root, command, command === "capture" ? args.slice(1).join(" ") : undefined); console.log(`${command} queued.`);
   } else if (command === "add" || command === "change") {
-    const flags = command === "add" ? ["--slice", "--title", "--goal", "--acceptance", "--check", "--revision"] : ["--task", "--goal", "--revision"];
+    const common = ["--type", "--uncertainty", "--depends", "--files", "--domains", "--verify"];
+    const required = command === "add" ? ["--slice", "--title", "--goal", "--acceptance", "--check", "--revision"] : ["--task", "--goal", "--revision"];
+    const flags = [...required, ...common];
     const options = new Map<string, string>();
     for (let i = 1; i < args.length; i += 2) {
       const flag = args[i], content = args[i + 1];
       if (!flags.includes(flag) || options.has(flag) || content === undefined || !content.trim()) throw new Error(`Invalid ${command} option: ${flag ?? "(missing)"}`);
       options.set(flag, content);
     }
-    for (const flag of flags) if (!options.has(flag)) throw new Error(`${command} requires ${flag}`);
+    for (const flag of required) if (!options.has(flag)) throw new Error(`${command} requires ${flag}`);
     const revisionText = options.get("--revision")!;
     if (!/^(0|[1-9]\d*)$/.test(revisionText) || !Number.isSafeInteger(Number(revisionText))) throw new Error("Invalid roadmap revision");
     const revision = Number(revisionText);
-    if (command === "add") await queueRoadmapEdit(root, { type: "add", slice: options.get("--slice")!, title: options.get("--title")!, goal: options.get("--goal")!, acceptance: options.get("--acceptance")!, check: options.get("--check")!, revision });
-    else await queueRoadmapEdit(root, { type: "change", task: options.get("--task")!, goal: options.get("--goal")!, revision });
+    const list = (flag: string) => options.has(flag) ? options.get(flag) === "-" ? [] : options.get(flag)!.split(",").map(x => x.trim()) : undefined;
+    const hints = {
+      ...(options.has("--type") ? { taskType: options.get("--type")! } : {}),
+      ...(options.has("--uncertainty") ? { uncertainty: options.get("--uncertainty")! } : {}),
+      ...(options.has("--depends") ? { dependencies: list("--depends")! } : {}),
+      ...(options.has("--files") ? { affectedFiles: list("--files")! } : {}),
+      ...(options.has("--domains") ? { affectedDomains: list("--domains")! } : {}),
+      ...(options.has("--verify") ? { verificationRequirements: [options.get("--verify")!] } : {}),
+    };
+    if (command === "add") await queueRoadmapEdit(root, { type: "add", slice: options.get("--slice")!, title: options.get("--title")!, goal: options.get("--goal")!, acceptance: options.get("--acceptance")!, check: options.get("--check")!, revision, ...hints } as Parameters<typeof queueRoadmapEdit>[1]);
+    else await queueRoadmapEdit(root, { type: "change", task: options.get("--task")!, goal: options.get("--goal")!, revision, ...hints } as Parameters<typeof queueRoadmapEdit>[1]);
     console.log(`${command} queued for roadmap revision ${revision}; run the controller to apply it.`);
   } else if (command === "recover") { await recoverLock(root); console.log("Dead-controller lock cleared. Run ship run to reconcile persisted work."); }
   else if (command === "run") {

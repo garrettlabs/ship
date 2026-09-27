@@ -73,7 +73,7 @@ function parseStatus(json: string): Status {
   return s;
 }
 
-const help = "Ship commands: /ship status (project and roadmap); /ship run (confirm and launch detached controller); /ship pause and /ship resume (queue controls); /ship add (queue a task in a slice); /ship change (queue an unstarted task goal). Queued requests take effect only at a controller safe boundary.";
+const help = "Ship commands: /ship status (project and roadmap); /ship run (confirm and launch detached controller); /ship pause and /ship resume (queue controls); /ship add (queue a fully planned task in a slice); /ship change (queue an unstarted task goal and planning-hint change). Queued requests take effect only at a controller safe boundary.";
 
 export function createShipExtension(execute: ShipCliRunner = runShipCli) {
   return (api: ExtensionAPI): void => {
@@ -127,10 +127,23 @@ export function createShipExtension(execute: ShipCliRunner = runShipCli) {
             if (!input.trim()) { ctx.ui.notify(`Task ${field} cannot be empty.`, "error"); return; }
             values.push(input.trim());
           }
+          const hints: string[] = [];
+          for (const [label, flag, placeholder] of [
+            ["semantic type", "--type", "Optional: implementation, documentation, migration, ..."],
+            ["uncertainty", "--uncertainty", "Optional: LOW, MEDIUM, HIGH, UNKNOWN"],
+            ["prerequisites", "--depends", "Optional: comma-separated task IDs; - clears existing prerequisites"],
+            ["owned files", "--files", "Optional: comma-separated paths; - clears existing files"],
+            ["owned domains", "--domains", "Optional: comma-separated domains; - clears existing domains"],
+            ["verification requirement", "--verify", "Optional: additional requirement; existing checks remain"],
+          ]) {
+            const input = await ctx.ui.input(`Task ${label}`, placeholder);
+            if (input === undefined) return;
+            if (input.trim()) hints.push(flag, input.trim());
+          }
           if (!await ctx.ui.confirm(`${action === "add" ? "Queue new task" : "Queue goal change"} for ${id}?`, `Roadmap r${s.roadmapRevision}. This request will be applied at a controller safe boundary only if the revision is still current.`)) return;
           const argv = action === "add"
-            ? ["add", "--slice", id, "--title", values[0], "--goal", values[1], "--acceptance", values[2], "--check", values[3], "--revision", String(s.roadmapRevision)]
-            : ["change", "--task", id, "--goal", values[0], "--revision", String(s.roadmapRevision)];
+            ? ["add", "--slice", id, "--title", values[0], "--goal", values[1], "--acceptance", values[2], "--check", values[3], "--revision", String(s.roadmapRevision), ...hints]
+            : ["change", "--task", id, "--goal", values[0], "--revision", String(s.roadmapRevision), ...hints];
           await call(argv);
           ctx.ui.notify(`Ship ${action} request queued for ${id} at roadmap r${s.roadmapRevision}; not applied yet. The controller will validate it at a safe boundary.`, "info");
         } catch (error) {

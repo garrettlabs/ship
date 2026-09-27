@@ -130,7 +130,7 @@ test("legacy state normalization preserves active attempt and commits only on sa
   state.activeAttempt = { id: "attempt-3", key: "M001/S01/T01", baseHead: "base", stage: "verifying", commands: ["frozen check"], revision: 6, tree: "tree" };
   const legacy = structuredClone(state);
   const old = legacy.milestones[0].slices[0].tasks[0] as unknown as Record<string, unknown>;
-  for (const key of ["objective", "dependencies", "affectedDomains", "affectedFiles", "taskType", "uncertainty", "verificationRequirements", "verificationPlan", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute", "execution"]) delete old[key];
+  for (const key of ["objective", "dependencies", "dependencyLevel", "affectedDomains", "affectedFiles", "taskType", "uncertainty", "verificationRequirements", "verificationPlan", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute", "execution"]) delete old[key];
   await atomicJson(statePath(root), legacy);
   const before = await readFile(statePath(root), "utf8");
   const migrated = await loadState(root);
@@ -139,6 +139,7 @@ test("legacy state normalization preserves active attempt and commits only on sa
   assert.equal(migrated.milestones[0].slices[0].tasks[0].status, "verifying");
   assert.equal(migrated.milestones[0].slices[0].tasks[0].attempts, 3);
   assert.equal(migrated.milestones[0].slices[0].tasks[0].objective, old.goal);
+  assert.equal(migrated.milestones[0].slices[0].tasks[0].dependencyLevel, 0);
   assert.equal(migrated.milestones[0].slices[0].tasks[0].execution.role, "task");
   assert.deepEqual(migrated.milestones[0].slices[0].tasks[0].verificationPlan.requirements.map(r => r.command), existing.verificationCommands);
   await saveState(root, migrated);
@@ -154,21 +155,24 @@ test("legacy state normalization preserves active attempt and commits only on sa
   const tamperedVerification = structuredClone(reloaded); tamperedVerification.milestones[0].slices[0].tasks[0].verificationPlan.requirements[0].reason = "manual override";
   await atomicJson(statePath(root), tamperedVerification);
   await assert.rejects(loadState(root), /Invalid persisted verificationPlan/);
+  const tamperedLevel = structuredClone(reloaded); tamperedLevel.milestones[0].slices[0].tasks[0].dependencyLevel = 99;
+  await atomicJson(statePath(root), tamperedLevel);
+  await assert.rejects(loadState(root), /Invalid persisted dependencyLevel/);
 });
 
-test("goal-only edits retain stable objectives, acceptance, checks, and refreshed classification", async t => {
+test("goal edits refresh the objective and classification without weakening acceptance or checks", async t => {
   const root = await fixture(t); const state = await loadState(root);
   state.milestones = parsePlan(plan()); state.roadmapRevision = 1;
   const initial = state.milestones[0].slices[0].tasks[0];
   applyRoadmapEdit(state, { type: "change", task: "M001/S01/T01", goal: "change authentication permissions", revision: 1 });
   const updated = state.milestones[0].slices[0].tasks[0];
-  assert.equal(updated.objective, initial.objective);
+  assert.equal(updated.objective, "change authentication permissions");
   assert.deepEqual(updated.acceptance, initial.acceptance);
   assert.deepEqual(updated.verificationCommands, initial.verificationCommands);
   assert.equal(updated.risk, "HIGH");
   assert.equal(updated.execution.verificationSpecialist, "security-reviewer");
   applyReview(state, JSON.stringify({ revision: 2, rationale: "implementation revision", lessons: [], changes: [{ task: "M001/S01/T01", goal: "implement using local file", reason: "evidence" }] }), "test");
-  assert.equal(updated.objective, initial.objective); assert.equal(updated.risk, "UNKNOWN");
+  assert.equal(updated.objective, "implement using local file"); assert.equal(updated.risk, "UNKNOWN");
   assert.equal(updated.execution.verificationSpecialist, undefined);
   applyRoadmapEdit(state, { type: "add", slice: "M001/S01", title: "Second result", goal: "produce second result", acceptance: "second result works", check: "test -f second", revision: 3 });
   assert.equal(state.milestones[0].slices[0].tasks[1].objective, "produce second result");
