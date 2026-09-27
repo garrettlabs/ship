@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { access, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import type { RepoCheck, Task, VerificationKind, VerificationPlan } from "./types.ts";
 
@@ -14,15 +14,28 @@ export async function discoverRepoChecks(root: string): Promise<RepoCheck[]> {
     if (error.code === "ENOENT") return undefined;
     throw error;
   });
+  const exists = async (name: string) => access(path.join(root, name)).then(() => true, (error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  });
   const pkg = await file("package.json");
   if (pkg) {
     const metadata: unknown = JSON.parse(pkg);
+    const manager = metadata && typeof metadata === "object" && "packageManager" in metadata && typeof metadata.packageManager === "string"
+      ? /^(npm|pnpm|yarn|bun)@\S+$/.exec(metadata.packageManager)?.[1]
+      : undefined;
+    const lockManagers = manager ? [] : (await Promise.all([
+      ["pnpm", "pnpm-lock.yaml"], ["yarn", "yarn.lock"], ["bun", "bun.lock"],
+      ["bun", "bun.lockb"], ["npm", "package-lock.json"], ["npm", "npm-shrinkwrap.json"],
+    ].map(async ([name, lock]) => await exists(lock) ? name : undefined))).filter((name): name is string => name !== undefined);
+    const uniqueManagers = new Set(lockManagers);
+    const scriptRunner = manager ?? (uniqueManagers.size > 1 ? undefined : lockManagers[0] ?? "npm");
     const scripts: unknown = metadata && typeof metadata === "object" && "scripts" in metadata ? metadata.scripts : undefined;
     if (scripts && typeof scripts === "object" && !Array.isArray(scripts)) {
       const defined = scripts as Record<string, unknown>;
       const script = (kind: RepoCheck["kind"], ...names: string[]) => {
         const name = names.find(name => { const value = defined[name]; return typeof value === "string" && Boolean(value.trim()); });
-        if (name) add(kind, `npm run ${name}`, `package.json scripts.${name}`);
+        if (name && scriptRunner) add(kind, `${scriptRunner} run ${name}`, `package.json scripts.${name}`);
       };
       script("focused-tests", "test:unit", "test:focused");
       script("broader-tests", "test", "test:all");
@@ -52,6 +65,32 @@ export async function discoverRepoChecks(root: string): Promise<RepoCheck[]> {
   if (await file("go.mod")) {
     add("broader-tests", "go test ./...", "go.mod"); add("lint", "go vet ./...", "go.mod");
     add("build", "go build ./...", "go.mod");
+  }
+  if (await exists("pom.xml")) {
+    const mvn = await exists(process.platform === "win32" ? "mvnw.cmd" : "mvnw")
+      ? process.platform === "win32" ? "./mvnw.cmd" : "./mvnw"
+      : "mvn";
+    add("broader-tests", `${mvn} test`, "pom.xml");
+    add("build", `${mvn} package`, "pom.xml");
+  }
+  const gradleFile = await exists("build.gradle") ? "build.gradle"
+    : await exists("build.gradle.kts") ? "build.gradle.kts" : undefined;
+  if (gradleFile) {
+    const gradle = await exists(process.platform === "win32" ? "gradlew.bat" : "gradlew")
+      ? process.platform === "win32" ? "./gradlew.bat" : "./gradlew"
+      : "gradle";
+    const build = (await file(gradleFile))!.replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "");
+    const javaPlugin = /\b(?:id\s*(?:\(\s*)?["']java(?:-library)?["']|apply\s*(?:\(\s*plugin\s*=\s*|plugin\s*:\s*)["']java(?:-library)?["']|\bjava\b(?=\s*(?:\}|$)))/m.test(build);
+    const declaredTest = /\b(?:tasks\s*\.\s*(?:register|create)\s*(?:<[^>]+>)?\s*\(\s*["']test["']|task\s*(?:\(\s*["']test["']|\s+test\b))/.test(build);
+    const workflows = await readdir(path.join(root, ".github", "workflows")).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    const ciTest = (await Promise.all(workflows.filter(name => /\.ya?ml$/.test(name)).sort().slice(0, 24)
+      .map(name => file(path.join(".github", "workflows", name))))).some(content =>
+      content && /^\s*(?:-\s*)?(?:run:\s*)?(?:\.\/gradlew(?:\.bat)?|gradle)\s+test(?:\s|$)/m.test(content));
+    if (javaPlugin || declaredTest || ciTest) add("broader-tests", `${gradle} test`, gradleFile);
+    add("build", `${gradle} build`, gradleFile);
   }
   const pyproject = await file("pyproject.toml");
   if (pyproject) {

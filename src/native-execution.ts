@@ -1,15 +1,17 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { lstat, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { DependencyGraph } from "./dependency-graph.ts";
 import { tasks, refresh, parsePlan, recomputeJudgedTask } from "./model.ts";
 import { plannerPrompt } from "./prompts.ts";
 import { runCheck } from "./process.ts";
 import { acquireLock } from "./lock.ts";
-import { discoverRepoChecks } from "./verification.ts";
+import { discoverRepoChecks, routeVerification } from "./verification.ts";
 import { appendEvent, atomicJson, consumeInbox, loadConfig, loadState, saveState, shipDir, writeRoadmapView } from "./store.ts";
+import { gitDirtySnapshot, readProjectProfile, type GitDirtySnapshot } from "./project-profile.ts";
 import { assertNoProcess } from "./process.ts";
-import type { Milestone, NativeAssignment, NativeBatch, RepoCheck, ShipConfig, ShipState } from "./types.ts";
+import type { Milestone, NativeAssignment, NativeBatch, RepoCheck, ShipConfig, ShipState, Task } from "./types.ts";
 import { applyDecision, confidenceThreshold, eligibleRoles, fallback, hashJudgmentRequest, judgmentTimeoutMs, parseChoice, parseSemanticAnswers, semanticTaskTypes } from "./judgment.ts";
 import type { ExecutionRole, RoutingDecision } from "./types.ts";
 
@@ -43,7 +45,7 @@ function instructions(root: string, batch: NativeBatch, state: ShipState): strin
     const task = entries.find(entry => entry.key === assignment.key)!.t;
     const prerequisites = graph.dependencies.get(assignment.key)!;
     const name = `Ship${assignment.id.replaceAll("-", "").slice(0, 26)}`;
-    if (batch.stage === "reviewing") return `- ${assignment.key} [${assignment.id}]: Independently review completed work against: ${task.acceptance.join("; ")}. ${task.verificationPlan.requirements.filter(r => !r.command).map(r => `${r.kind}: ${r.reason}`).join("; ")}. Use OMP task tool agent: "${task.execution.verificationSpecialist ?? "reviewer"}", name: "${name}", and include assignment ID ${assignment.id} in its task text; not the original writer. Await substantive review findings before reporting.`;
+    if (batch.stage === "reviewing") return `- ${assignment.key} [${assignment.id}]: Independently review completed work against: ${task.acceptance.join("; ")}. ${task.verificationPlan.requirements.filter(r => !r.command).map(r => `${r.kind}: ${r.reason}`).join("; ")}. Use OMP task tool agent: "${task.execution.verificationSpecialist ?? "reviewer"}", name: "${name}", and include assignment ID ${assignment.id} in its task text; not the original writer. ${task.execution.verificationSpecialist === "security-reviewer" ? "Report your native security-reviewer coverage_summary, findings and any deferred work; substantive findings or deferred work cannot pass." : "Report your native reviewer overall_correctness verdict and findings; actionable findings or an adverse/unknown verdict cannot pass."} Await substantive review findings before reporting.`;
     const route = task.execution;
     const agent = route.specialist ?? (route.role === "smol" ? "sonic" : "task");
     const dispatch = route.mode === "main" ? "Work directly in the main session without a subagent"
@@ -51,7 +53,156 @@ function instructions(root: string, batch: NativeBatch, state: ShipState): strin
     return `- ${assignment.key} [${assignment.id}]: ${task.title}. Goal: ${task.goal}. Objective: ${task.objective}. Acceptance: ${task.acceptance.join("; ")}. Dependencies already passed: ${prerequisites.join(", ") || "none"}. Owned files: ${task.affectedFiles.join(", ") || "unspecified"}; domains: ${task.affectedDomains.join(", ") || "unspecified"}. ${dispatch}. Stored route: ${route.role}${route.specialist ? `/${route.specialist}` : ""}; ${route.reason}. ${task.lastError ? `Previous failure (repair only within scope): ${task.lastError}` : ""}`;
   });
   const reporting = `After each assignment finishes, call ship_outcome with batchId ${batch.id}, its assignmentId, status passed/failed/partial, and a concrete summary of actual results. Report failures and partial work honestly; do not claim success from intention. SHIP runs required verification itself and will issue a follow-up batch only after every assignment has reported. Do not launch any separate SHIP process for these assignments.`;
-  return `SHIP OMP-native ${batch.stage} batch for ${root}, roadmap revision ${batch.revision}. ${batch.assignments.length > 1 ? "These tasks form a proven safe parallel group with disjoint ownership: dispatch in ONE OMP task tool batch when task.batch is enabled; otherwise launch separate OMP eval agent() calls concurrently with the same agent names and await all results. Do not run verification/build/formatters in parallel with sibling edits." : "Perform this one assignment before asking SHIP for successors."}\n${lines.join("\n")}\n${reporting}`;
+  return `SHIP OMP-native ${batch.stage} batch for ${root}, roadmap revision ${batch.revision}. ${batch.assignments.length > 1 ? "These tasks form a proven safe parallel group with disjoint ownership: dispatch in ONE OMP task tool batch when task.batch is enabled; otherwise launch separate OMP eval agent() calls concurrently with the same agent names and await all results. Do not run verification/build/formatters in parallel with sibling edits." : "Perform this one assignment before asking SHIP for successors."}${state.preexistingWork?.paths.length ? `\nPreexisting user changes (DO NOT overwrite, discard, reset or claim ownership): ${state.preexistingWork.paths.join(", ")}. Preserve unrelated changes; stop if work unexpectedly overlaps.` : ""}\n${lines.join("\n")}\n${reporting}`;
+}
+
+function normalizedPath(value: string): string {
+  const relative = value.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, "");
+  return process.platform === "win32" ? relative.toLowerCase() : relative;
+}
+function overlaps(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+function ownershipConflict(state: ShipState, candidate: readonly { key: string }[]): string | undefined {
+  const work = state.preexistingWork;
+  if (!work || (!work.paths.length && !work.truncated && !work.unknown)) return undefined;
+  if (work.unknown || work.truncated) return "Git changes cannot be fully inspected for safe ownership";
+  const entries = tasks(state);
+  for (const assignment of candidate) {
+    const task = entries.find(entry => entry.key === assignment.key)!.t;
+    if (!task.affectedFiles.length) return `${assignment.key} has no declared file ownership while the checkout contains user changes`;
+    for (const owned of task.affectedFiles) {
+      const file = normalizedPath(owned);
+      if (!file || file === "." || file.startsWith("/") || file.includes("..") || /[*?{}]/.test(file)) return `${assignment.key} has uncertain file ownership: ${owned}`;
+      const conflicting = work.paths.find(dirty => overlaps(normalizedPath(dirty), file));
+      if (conflicting) return `${assignment.key} overlaps preexisting user change ${conflicting}`;
+    }
+  }
+}
+
+/** A successful OMP process is not a passing review. Unknown or conflicting verdicts fail closed. */
+export function reviewVerdict(payload: unknown): "correct" | "incorrect" | "unknown" {
+  const seen = new Set<unknown>();
+  const visit = (value: unknown): "correct" | "incorrect" | "unknown" => {
+    if (typeof value === "string") {
+      try { return visit(JSON.parse(value)); } catch { /* The result may be formatted text. */ }
+      const verdicts = [...value.matchAll(/\b(?:overall_correctness\s*["':= ]+\s*|patch is\s+)(correct|incorrect)\b/gi)].map(match => match[1].toLowerCase());
+      return verdicts.length && verdicts.every(item => item === verdicts[0]) ? verdicts[0] as "correct" | "incorrect" : "unknown";
+    }
+    if (!value || typeof value !== "object" || seen.has(value)) return "unknown";
+    seen.add(value);
+    const record = value as Record<string, unknown>;
+    if (record.status === "invalid" || record.status === "unavailable") return "unknown";
+    const verdicts: ("correct" | "incorrect")[] = [];
+    if ("coverage_summary" in record) {
+      if (typeof record.coverage_summary !== "string" || !record.coverage_summary.trim() ||
+          (record.findings !== undefined && !Array.isArray(record.findings)) ||
+          (record.deferred !== undefined && !Array.isArray(record.deferred)) ||
+          (record.reviewed_paths !== undefined && (!Array.isArray(record.reviewed_paths) || record.reviewed_paths.some(item => typeof item !== "string")))) return "unknown";
+      if ((record.deferred as unknown[] | undefined)?.length) return "unknown";
+      const findings = record.findings as { severity?: unknown }[] | undefined;
+      if (findings?.some(finding => !finding || !["critical", "high", "medium", "low", "informational"].includes(String(finding.severity)))) return "unknown";
+      verdicts.push(findings?.some(finding => finding.severity !== "informational") ? "incorrect" : "correct");
+    } else if (record.findings !== undefined) {
+      if (!Array.isArray(record.findings) || record.findings.some(finding => !finding || !Number.isInteger(finding.priority) || finding.priority < 0 || finding.priority > 3)) return "unknown";
+      if (record.findings.some(finding => finding.priority < 3)) verdicts.push("incorrect");
+    }
+    if (record.overall_correctness === "correct" || record.overall_correctness === "incorrect") verdicts.push(record.overall_correctness);
+    else if ("overall_correctness" in record) return "unknown";
+    for (const key of ["data", "structuredOutput", "structured", "summary", "output", "resultText"]) {
+      if (key in record) {
+        const verdict = visit(record[key]);
+        if (verdict !== "unknown") verdicts.push(verdict);
+      }
+    }
+    return verdicts.length && verdicts.every(item => item === verdicts[0]) ? verdicts[0] : "unknown";
+  };
+  return visit(payload);
+}
+
+/** Extend declared repository checks while preserving the task's frozen acceptance commands. */
+async function refreshChecks(root: string, state: ShipState): Promise<void> {
+  const previous = state.repoChecks ?? [];
+  const discovered = await discoverRepoChecks(root);
+  const added = discovered.filter(check => !previous.some(old => old.kind === check.kind && old.command === check.command));
+  if (!added.length) return;
+  state.repoChecks = [...previous, ...added];
+  for (const { t } of tasks(state)) {
+    const plan = routeVerification({ ...t, taskType: t.effectiveTaskType ?? t.taskType }, state.repoChecks);
+    const addedForTask = plan.requirements.filter(requirement => requirement.command &&
+      !t.verificationPlan.requirements.some(old => old.kind === requirement.kind && old.command === requirement.command));
+    t.verificationPlan = plan;
+    if (t.status === "passed" && addedForTask.length) {
+      t.status = "failed";
+      t.lastError = `New repository checks require verification: ${addedForTask.map(requirement => requirement.command).join(", ")}`;
+    }
+  }
+}
+
+async function fingerprint(root: string, filename: string): Promise<string> {
+  try {
+    const fullPath = path.join(root, filename);
+    const stat = await lstat(fullPath);
+    if (stat.isDirectory()) return "directory";
+    if (!stat.isFile()) return "unknown";
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(fullPath)) hash.update(chunk);
+    return hash.digest("hex");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+    throw error;
+  }
+}
+
+/** Capture this batch's owned paths without blessing edits to earlier, unrelated task files. */
+async function snapshotOwned(root: string, state: ShipState, batch: NativeBatch): Promise<void> {
+  const current = await gitDirtySnapshot(root);
+  if (current.unknown || current.truncated) {
+    delete state.ownedSnapshots;
+    return;
+  }
+  const owned = batch.assignments.flatMap(assignment => tasks(state).find(entry => entry.key === assignment.key)!.t.affectedFiles.map(normalizedPath));
+  const paths = [...new Set([...owned, ...current.paths.filter(filename => owned.some(file => overlaps(normalizedPath(filename), file)))])];
+  const previous = state.ownedSnapshots ?? {};
+  const unchanged = Object.fromEntries(Object.entries(previous).filter(([filename]) => !owned.some(file => overlaps(filename, file))));
+  state.ownedSnapshots = { ...unchanged, ...Object.fromEntries(await Promise.all(paths.map(async filename => [normalizedPath(filename), await fingerprint(root, filename)]))) };
+}
+
+async function interveningEdit(root: string, state: ShipState, current: GitDirtySnapshot, ready: readonly { task: Task }[]): Promise<string | undefined> {
+  const owned = tasks(state).filter(entry => entry.t.attempts > 0).flatMap(entry => entry.t.affectedFiles.map(normalizedPath));
+  const next = ready.flatMap(entry => entry.task.affectedFiles.map(normalizedPath));
+  if (!owned.length || !next.length) return;
+  if ((current.unknown || current.truncated) && owned.some(file => next.some(target => overlaps(file, target)))) return "Cannot establish whether previously owned files changed since the last task";
+  const snapshots = state.ownedSnapshots;
+  for (const filename of [...new Set([...current.paths, ...Object.keys(snapshots ?? {})])]) {
+    const normalized = normalizedPath(filename);
+    if (!owned.some(file => overlaps(normalized, file)) || !next.some(file => overlaps(normalized, file))) continue;
+    if (!snapshots || snapshots[normalized] === "unknown" || snapshots[normalized] !== await fingerprint(root, filename)) return `Previously owned file changed after its task: ${filename}`;
+  }
+}
+
+/** Changes outside previously owned task paths remain user-owned, even between batches. */
+function reconcileDirtyPaths(state: ShipState, current: GitDirtySnapshot, ready: readonly { task: { affectedFiles: string[] } }[]): void {
+  const work = state.preexistingWork;
+  if (!work) return;
+  const attempted = tasks(state).filter(entry => entry.t.attempts > 0);
+  const owned = attempted.flatMap(entry => entry.t.affectedFiles.map(normalizedPath));
+  const legacyUnknown = attempted.some(entry => !entry.t.affectedFiles.length);
+  const nextOwned = ready.flatMap(entry => entry.task.affectedFiles.map(normalizedPath));
+  const existing = new Set(work.paths.map(normalizedPath));
+  for (const dirty of current.paths) {
+    const filename = normalizedPath(dirty);
+    if (existing.has(filename) || owned.some(file => overlaps(filename, file))) continue;
+    // Older roadmaps without ownership cannot attribute their own newly created files.
+    // Still guard every new dirty file a known upcoming task might touch.
+    if (legacyUnknown && !nextOwned.some(file => overlaps(filename, file))) continue;
+    if (work.paths.length === 256) { work.truncated = true; break; }
+    work.paths.push(dirty);
+    existing.add(filename);
+  }
+  work.truncated ||= current.truncated;
+  work.unknown ||= current.unknown;
 }
 
 function chooseBatch(state: ShipState, config: ShipConfig, sessionId: string): NativeBatch | undefined {
@@ -86,6 +237,12 @@ async function advance(root: string, state: ShipState, config: ShipConfig, sessi
     delete state.pendingJudgment;
     await persist(root, state, "native_judgment_fallback", { reason });
   }
+  const currentGit = await gitDirtySnapshot(root);
+  if (state.preexistingWork && currentGit.branch !== state.preexistingWork.branch) {
+    state.phase = "blocked"; state.blockedReason = "Git branch changed since SHIP established task ownership; inspect work before resuming";
+    await persist(root, state, "blocked", { reason: state.blockedReason }); return `SHIP blocked: ${state.blockedReason}`;
+  }
+  if (state.milestones.length) await refreshChecks(root, state);
   if (state.nativeBatch) {
     const batch = state.nativeBatch;
     if (batch.sessionId !== sessionId) return "SHIP batch belongs to a different OMP session; report outstanding outcomes there.";
@@ -113,7 +270,21 @@ async function advance(root: string, state: ShipState, config: ShipConfig, sessi
       state.dispatches = (state.dispatches ?? 0) + 1;
     }
     state.phase = "planning"; await persist(root, state, "native_planning_started", { planning: state.nativePlanning.id });
-    return `SHIP OMP-native planning for ${root}. Use OMP task tool agent: "task", name: "ShipPlanner", to inspect without modifying files. Pass the entire planner task text below verbatim as the task agent's task prompt; do not summarize it or replace its JSON contract with a prose request. Await the agent's final answer, which MUST be raw JSON only (no Markdown, fences, or commentary) with the full milestones -> slices -> tasks schema below. In the main session, call ship_plan with planningId ${state.nativePlanning.id} and plan set to that complete raw JSON answer, not a Markdown summary or a partial plan.\n\nPLANNER TASK TEXT (pass everything below verbatim):\n${plannerPrompt(await readFile(path.join(shipDir(root), "PROJECT.md"), "utf8"))}`;
+    const profile = await readProjectProfile(root);
+    const dirty = state.preexistingWork;
+    const context = [
+      profile.facts.instructions.length ? `Existing repository instructions (read these first; they take precedence over SHIP defaults): ${profile.facts.instructions.join(", ")}` : "",
+      profile.facts.ecosystems.length ? `Observed ecosystems: ${profile.facts.ecosystems.join(", ")}` : "",
+      profile.facts.packageManagers.length ? `Observed package managers: ${profile.facts.packageManagers.join(", ")}` : "",
+      Object.keys(profile.facts.commands).length ? `Observed declared verification commands: ${JSON.stringify(profile.facts.commands)}` : "",
+      profile.facts.layout.length ? `Observed source/workspace layout: ${profile.facts.layout.join(", ")}` : "",
+      profile.facts.ci.length ? `Existing CI workflows (inspect for authoritative checks): ${profile.facts.ci.join(", ")}` : "",
+      profile.facts.migrations.length ? `Observed migration tooling: ${profile.facts.migrations.join(", ")}` : "",
+      profile.unknowns.length ? `Unresolved facts (investigate if relevant; never assume): ${profile.unknowns.join(", ")}` : "",
+      dirty?.paths.length || dirty?.truncated ? `Git branch ${dirty.branch ?? "(unknown)"}; preexisting user changes: ${dirty.paths.join(", ")}${dirty.truncated ? " (more paths omitted)" : ""}. Do not overwrite these paths; plan explicit disjoint ownership or reconnaissance before changes.` : "",
+    ].filter(Boolean).join("\n");
+    const brief = await readFile(path.join(shipDir(root), "PROJECT.md"), "utf8");
+    return `SHIP OMP-native planning for ${root}. Use OMP task tool agent: "task", name: "ShipPlanner", to inspect without modifying files. Pass the entire planner task text below verbatim as the task agent's task prompt; do not summarize it or replace its JSON contract with a prose request. Await the agent's final answer, which MUST be raw JSON only (no Markdown, fences, or commentary) with the full milestones -> slices -> tasks schema below. In the main session, call ship_plan with planningId ${state.nativePlanning.id} and plan set to that complete raw JSON answer, not a Markdown summary or a partial plan.\n\nPLANNER TASK TEXT (pass everything below verbatim):\n${plannerPrompt(context ? `${brief}\n\nRepository observations (profile is a cache; inspect current source before decisions):\n${context}` : brief)}`;
   }
   if (tasks(state).every(entry => entry.t.status === "passed")) {
     const checks = [...new Set((state.repoChecks ?? []).filter(check => check.kind === "integration").map(check => check.command))];
@@ -134,6 +305,18 @@ async function advance(root: string, state: ShipState, config: ShipConfig, sessi
     }
     state.phase = "complete"; delete state.blockedReason;
     await persist(root, state, "project_completed"); return "SHIP complete: all tasks passed required verification and configured integration checks.";
+  }
+  const ready = new DependencyGraph(state.milestones).readyTasks();
+  reconcileDirtyPaths(state, currentGit, ready);
+  const intervening = await interveningEdit(root, state, currentGit, ready);
+  if (intervening) {
+    state.phase = "blocked"; state.blockedReason = intervening;
+    await persist(root, state, "blocked", { reason: intervening }); return `SHIP blocked: ${intervening}`;
+  }
+  const conflict = ownershipConflict(state, ready);
+  if (conflict) {
+    state.phase = "blocked"; state.blockedReason = conflict;
+    await persist(root, state, "blocked", { reason: conflict }); return `SHIP blocked: ${conflict}`;
   }
   if (config.judgment?.enabled) {
     const next = new DependencyGraph(state.milestones).readyTasks().find(node => node.task.routingDecision.reason === "disabled");
@@ -190,6 +373,12 @@ export function startNativeRun(root: string, sessionId: string, routing?: Routin
     const state = await loadState(root);
     if (state.workspace) throw new Error("Standalone worktree state cannot be reused in OMP's checkout; use a fresh native project");
     if (state.activeAttempt) throw new Error("A standalone controller attempt is active; reconcile it before OMP-native execution");
+    if (!state.preexistingWork) {
+      const snapshot = await gitDirtySnapshot(root);
+      state.preexistingWork = { branch: snapshot.branch, paths: snapshot.paths, ...(snapshot.truncated ? { truncated: true } : {}), ...(snapshot.unknown ? { unknown: true } : {}) };
+      await saveState(root, state);
+    }
+    await readProjectProfile(root);
     await consumeInbox(root, state);
     return advance(root, state, await loadConfig(root), sessionId, routing);
   });
@@ -238,6 +427,13 @@ export function submitNativePlan(root: string, sessionId: string, planningId: st
     const state = await loadState(root), config = await loadConfig(root);
     if (state.workspace || state.nativeBatch || state.milestones.length || !state.nativePlanning ||
         state.nativePlanning.id !== planningId || state.nativePlanning.sessionId !== sessionId) throw new Error("Stale or foreign native planning assignment");
+    await readProjectProfile(root);
+    const current = await gitDirtySnapshot(root);
+    if (state.preexistingWork) {
+      state.preexistingWork.paths = [...new Set([...state.preexistingWork.paths, ...current.paths])].slice(0, 256);
+      state.preexistingWork.truncated ||= current.truncated || state.preexistingWork.paths.length < new Set([...state.preexistingWork.paths, ...current.paths]).size;
+      state.preexistingWork.unknown ||= current.unknown;
+    }
     state.nativePlanning.attempts++;
     let approved: { checks: RepoCheck[]; milestones: Milestone[] };
     try {
@@ -289,8 +485,8 @@ export function routeNativeSpawn(root: string, sessionId: string, spawnKey: stri
   });
 }
 
-/** Record only a successfully completed OMP task result, correlated to its named assignment. */
-export function confirmNativeSpecialist(root: string, sessionId: string, assignmentId: string, agent: string): Promise<void> {
+/** Record a correlated completed result, including the review verdict rather than only process success. */
+export function confirmNativeSpecialist(root: string, sessionId: string, assignmentId: string, agent: string, result?: unknown): Promise<void> {
   return serialized(root, async () => {
     const state = await loadState(root), batch = state.nativeBatch;
     if (!batch || batch.sessionId !== sessionId || batch.awaitingBudget) return;
@@ -300,6 +496,7 @@ export function confirmNativeSpecialist(root: string, sessionId: string, assignm
     const expected = batch.stage === "reviewing" ? task.execution.verificationSpecialist ?? "reviewer" : task.execution.specialist;
     if (expected !== agent) return;
     assignment.specialistDispatched = true;
+    if (batch.stage === "reviewing") assignment.reviewVerdict ??= reviewVerdict(result);
     await saveState(root, state);
   });
 }
@@ -308,6 +505,7 @@ async function verify(root: string, state: ShipState, assignment: NativeAssignme
   const task = tasks(state).find(entry => entry.key === assignment.key)!.t;
   task.status = "verifying"; state.phase = "verifying";
   await persist(root, state, "verification_started", { task: assignment.key });
+  await refreshChecks(root, state);
   const commands = [...new Set([...(config.protectedChecks ?? []), ...task.verificationPlan.requirements.flatMap(requirement => requirement.command ? [requirement.command] : [])])];
   const checks: { command: string; ok: boolean; code: number | null; output: string }[] = [];
   const directory = path.join(shipDir(root), "attempts"); await mkdir(directory, { recursive: true });
@@ -329,15 +527,30 @@ async function verify(root: string, state: ShipState, assignment: NativeAssignme
 
 async function settle(root: string, state: ShipState, config: ShipConfig, sessionId: string, routing?: RoutingContext): Promise<string> {
   const batch = state.nativeBatch!;
+  await refreshChecks(root, state);
   const reviews: NativeAssignment[] = [];
   for (const entry of batch.assignments) {
     const task = tasks(state).find(item => item.key === entry.key)!.t;
     if (entry.status !== "passed") { task.status = "failed"; task.lastError = `${entry.status} ${batch.stage}: ${entry.summary}`; continue; }
-    if (batch.stage === "reviewing") { task.status = "passed"; delete task.lastError; continue; }
+    if (batch.stage === "reviewing") {
+      if (entry.reviewVerdict !== "correct") {
+        task.status = "failed"; task.lastError = `Required review ${entry.reviewVerdict ?? "unknown"}: ${entry.summary}`;
+        continue;
+      }
+      const required = task.verificationPlan.requirements.flatMap(requirement => requirement.command ? [requirement.command] : []);
+      if (!entry.verifiedCommands || required.some(command => !entry.verifiedCommands!.includes(command))) {
+        if (!await verify(root, state, entry, config)) continue;
+      }
+      task.status = "passed"; delete task.lastError; continue;
+    }
     if (task.status !== "passed" && !await verify(root, state, entry, config)) continue;
-    if (task.verificationPlan.requirements.some(r => r.kind === "independent-review" || r.kind === "security-review")) reviews.push({ id: randomUUID(), key: entry.key, status: "pending" });
+    if (task.verificationPlan.requirements.some(r => r.kind === "independent-review" || r.kind === "security-review")) reviews.push({
+      id: randomUUID(), key: entry.key, status: "pending",
+      verifiedCommands: task.verificationPlan.requirements.flatMap(requirement => requirement.command ? [requirement.command] : []),
+    });
     else { task.status = "passed"; delete task.lastError; }
   }
+  if (batch.stage === "executing") await snapshotOwned(root, state, batch);
   delete state.nativeBatch;
   if (reviews.length) {
     state.nativeBatch = { id: randomUUID(), sessionId, revision: state.roadmapRevision, stage: "reviewing", assignments: reviews, awaitingBudget: true };
@@ -355,6 +568,11 @@ export function reportNativeOutcome(root: string, sessionId: string, outcome: Na
     const state = await loadState(root), config = await loadConfig(root);
     const batch = state.nativeBatch;
     if (!batch || batch.sessionId !== sessionId || batch.id !== outcome.batchId || batch.revision !== state.roadmapRevision) throw new Error("Stale, foreign or unknown SHIP batch");
+    if (state.preexistingWork && (await gitDirtySnapshot(root)).branch !== state.preexistingWork.branch) {
+      state.phase = "blocked"; state.blockedReason = "Git branch changed since SHIP established task ownership; inspect work before resuming";
+      await persist(root, state, "blocked", { reason: state.blockedReason });
+      return `SHIP blocked: ${state.blockedReason}`;
+    }
     const assignment = batch.assignments.find(entry => entry.id === outcome.assignmentId);
     if (!assignment || assignment.status !== "pending") throw new Error("Unknown or already reported SHIP assignment");
     const task = tasks(state).find(item => item.key === assignment.key)!.t;
@@ -365,6 +583,9 @@ export function reportNativeOutcome(root: string, sessionId: string, outcome: Na
     }
     if (outcome.status === "passed" && (batch.stage === "reviewing" || task.execution.specialist) && !assignment.specialistDispatched) {
       throw new Error(`OMP ${batch.stage === "reviewing" ? "required reviewer" : task.execution.specialist} completed task result was not confirmed; cannot accept a successful outcome`);
+    }
+    if (outcome.status === "passed" && batch.stage === "reviewing" && assignment.reviewVerdict !== "correct") {
+      throw new Error(`Required reviewer verdict is ${assignment.reviewVerdict ?? "unknown"}; report failed or partial and repair findings`);
     }
     if (!outcome.summary?.trim() || outcome.summary.length > 16_000) throw new Error("Provide a concrete outcome summary (up to 16,000 characters)");
     assignment.status = outcome.status; assignment.summary = outcome.summary;

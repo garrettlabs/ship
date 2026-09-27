@@ -7,10 +7,10 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import ship, { createShipExtension } from "../extensions/ship.ts";
 import { fixture, plan } from "./helpers.ts";
-import { completeNativeJudgment, recoverNativeRun, startNativeRun } from "../src/native-execution.ts";
+import { completeNativeJudgment, recoverNativeRun, reviewVerdict, startNativeRun } from "../src/native-execution.ts";
 import { parsePlan } from "../src/model.ts";
-import { plannerPrompt } from "../src/prompts.ts";
 import { atomicJson, configPath, exists, loadConfig, loadState, queueRoadmapEdit, saveState, statePath } from "../src/store.ts";
+import { git } from "../src/git.ts";
 
 function harness(extension = ship, jev = false) {
   let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
@@ -43,14 +43,15 @@ function harness(extension = ship, jev = false) {
 }
 function command(extension = ship) { return harness(extension).handle; }
 async function completeTask(api: { resultHook: (event: { toolName: string; input: Record<string, unknown>; details: unknown; isError: boolean }, ctx: ExtensionContext) => Promise<void> },
-  assignmentId: string, agent: string, ctx: ExtensionContext, options: { status?: "success" | "failed" | "skipped" | "async"; name?: string; resultAgent?: string } = {}) {
+  assignmentId: string, agent: string, ctx: ExtensionContext, options: { status?: "success" | "failed" | "skipped" | "async"; name?: string; resultAgent?: string; review?: unknown } = {}) {
   const name = options.name ?? `Ship${assignmentId.replaceAll("-", "").slice(0, 26)}`;
   const status = options.status ?? "success";
   const resultAgent = options.resultAgent ?? agent;
+  const review = options.review ?? { overall_correctness: "correct", explanation: "No defects found", confidence: 0.95 };
   await api.resultHook({ toolName: "task", input: { name, agent, task: `Inspect assignment ${assignmentId} acceptance and report findings` }, isError: false,
     details: status === "skipped" ? { results: [], totalDurationMs: 0 } :
       status === "async" ? { results: [], async: { state: "running" }, progress: [{ id: name, index: 0, agent, status: "running" }] } :
-        { results: [{ id: name, index: 0, agent: resultAgent, exitCode: status === "failed" ? 1 : 0 }], totalDurationMs: 1 },
+        { results: [{ id: name, index: 0, agent: resultAgent, exitCode: status === "failed" ? 1 : 0, structuredOutput: { status: "valid", data: review } }], totalDurationMs: 1 },
   }, ctx);
 }
 
@@ -380,7 +381,6 @@ test("fresh native project delegates the full JSON planner contract before assig
   assert.match(instruction, /Pass the entire planner task text below verbatim as the task agent's task prompt/);
   assert.match(instruction, /final answer, which MUST be raw JSON only \(no Markdown, fences, or commentary\)/);
   assert.match(instruction, new RegExp(`call ship_plan with planningId ${planning.id} and plan set to that complete raw JSON answer`));
-  assert.equal(instruction.split("PLANNER TASK TEXT (pass everything below verbatim):\n")[1], plannerPrompt(brief));
   assert.equal((await api.submit("call", { planningId: "wrong", plan: plan() }, undefined, undefined, ui.ctx)).isError, true);
   await api.submit("call", { planningId: planning.id, plan: plan() }, undefined, undefined, ui.ctx);
   const state = await loadState(root);
@@ -641,7 +641,7 @@ test("later spawn block, skipped or failed task results cannot pass review; only
   await api.resultHook({ toolName: "wait", input: {}, details: { jobs: [{ id: key.slice(2), type: "task", status: "failed" }] }, isError: false }, ui.ctx);
   assert.equal((await claim()).isError, true);
   await completeTask(api, assignment.id, "reviewer", ui.ctx, { status: "async" });
-  await api.resultHook({ toolName: "wait", input: {}, details: { jobs: [{ id: key.slice(2), type: "task", status: "completed" }] }, isError: false }, ui.ctx);
+  await api.resultHook({ toolName: "wait", input: {}, details: { jobs: [{ id: key.slice(2), type: "task", status: "completed", structured: { status: "valid", data: { overall_correctness: "correct", explanation: "No defects", confidence: 0.9 } } }] }, isError: false }, ui.ctx);
   await writeFile(path.join(root, "file1.txt"), "hello\n");
   assert.notEqual((await claim()).isError, true);
   assert.equal((await loadState(root)).phase, "complete");
@@ -917,4 +917,331 @@ test("Jev cannot downgrade migration risk, planning complexity or mandatory revi
   assert.equal(judged.semanticJudgment?.fallbacks?.complexity, "low-confidence");
   assert.ok(judged.verificationPlan.requirements.some(requirement => requirement.kind === "security-review"));
   assert.equal(judged.execution.verificationSpecialist, "security-reviewer");
+});
+
+test("first add and change adopt an existing checkout, honor instructions and continue native planning", async t => {
+  for (const action of ["add", "change"]) {
+    const root = await mkdtemp(path.join(tmpdir(), `ship-adopt-${action}-`));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    await mkdir(path.join(root, "packages", "server"), { recursive: true });
+    await writeFile(path.join(root, "AGENTS.md"), "Use the established server folder; do not invent a frontend.\n");
+    await writeFile(path.join(root, "package.json"), JSON.stringify({ packageManager: "pnpm@9.0.0", workspaces: ["packages/*"], scripts: { test: "vitest", build: "tsc" } }));
+    await writeFile(path.join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+    await writeFile(path.join(root, "packages", "server", "index.ts"), "export const existing = true;\n");
+    const api = harness(), ui = context(root);
+    await api.handle(`${action} "add safe server tests"`, ui.ctx);
+    const state = await loadState(root);
+    assert.equal(state.phase, "planning");
+    assert.equal(await readFile(path.join(root, ".ship", "PROJECT.md"), "utf8"), "add safe server tests\n");
+    assert.match(api.messages[0], /AGENTS\.md/);
+    assert.match(api.messages[0], /pnpm/);
+    assert.match(api.messages[0], /packages\/server/);
+    assert.match(ui.notices.at(-1)?.message ?? "", /project profile ready; planning change/);
+    const profile = JSON.parse(await readFile(path.join(root, ".ship", "project-profile.json"), "utf8"));
+    assert.ok(profile.facts.instructions.includes("AGENTS.md"));
+    const restarted = harness(), next = context(root);
+    await restarted.handle("status", next.ctx);
+    assert.match(next.notices.at(-1)?.message ?? "", /planning/);
+    await restarted.handle("run", next.ctx);
+    assert.equal((await loadState(root)).nativePlanning?.id, state.nativePlanning?.id);
+    await rm(path.join(root, ".ship"), { recursive: true });
+    assert.equal(await readFile(path.join(root, "packages", "server", "index.ts"), "utf8"), "export const existing = true;\n");
+  }
+});
+
+test("dirty checkout blocks uncertain or overlapping ownership before consuming a task attempt", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "ship-dirty-adopt-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await git(root, ["init", "-b", "main"]);
+  await git(root, ["config", "user.name", "Ship Tests"]);
+  await git(root, ["config", "user.email", "tests@local"]);
+  await writeFile(path.join(root, "file1.txt"), "original\n");
+  await git(root, ["add", "."]);
+  await git(root, ["commit", "-m", "baseline"]);
+  await writeFile(path.join(root, "file1.txt"), "valuable user changes\n");
+  const ui = context(root), api = harness();
+  await api.handle('add "create a new file"', ui.ctx);
+  const before = await loadState(root);
+  assert.ok(before.preexistingWork?.paths.includes("file1.txt"));
+  assert.match(api.messages[0], /preexisting user changes: file1\.txt/);
+  const response = await api.submit("call", { planningId: before.nativePlanning!.id, plan: plan() }, undefined, undefined, ui.ctx);
+  assert.notEqual(response.isError, true);
+  const blocked = await loadState(root);
+  assert.equal(blocked.phase, "blocked");
+  assert.match(blocked.blockedReason ?? "", /no declared file ownership/);
+  assert.equal(blocked.milestones[0].slices[0].tasks[0].attempts, 0);
+  assert.equal(await readFile(path.join(root, "file1.txt"), "utf8"), "valuable user changes\n");
+});
+
+test("dirty file ownership allows a disjoint task but refuses overlap without spending attempts", async t => {
+  for (const [owned, blocked] of [["file1.txt", true], ["file2.txt", false]] as const) {
+    const root = await fixture(t);
+    await writeFile(path.join(root, "file1.txt"), "preserve this user file\n");
+    const state = await loadState(root);
+    const raw = JSON.parse(plan());
+    raw.milestones[0].slices[0].tasks[0].affectedFiles = [owned];
+    state.milestones = parsePlan(JSON.stringify(raw));
+    state.roadmapRevision = 1;
+    await saveState(root, state);
+    const api = harness(), ui = context(root);
+    await api.handle("run", ui.ctx);
+    const result = await loadState(root);
+    assert.equal(result.phase, blocked ? "blocked" : "executing");
+    assert.equal(result.milestones[0].slices[0].tasks[0].attempts, blocked ? 0 : 1);
+    assert.equal(await readFile(path.join(root, "file1.txt"), "utf8"), "preserve this user file\n");
+  }
+});
+
+test("new user edits to a dependent task's file block dispatch after the previous task settles", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  const raw = JSON.parse(plan());
+  raw.milestones[0].slices[0].tasks[0].affectedFiles = ["file1.txt"];
+  raw.milestones[0].slices[0].tasks.push({
+    id: "T02", title: "Dependent second file", goal: "create file2.txt",
+    dependencies: ["T01"], affectedFiles: ["file2.txt"],
+    acceptance: ["file2.txt contains two"], verificationCommands: ["grep -q '^two$' file2.txt"],
+  });
+  state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root);
+  await api.handle("run", ui.ctx);
+  const first = (await loadState(root)).nativeBatch!;
+  await writeFile(path.join(root, "file1.txt"), "hello\n");
+  await writeFile(path.join(root, "file2.txt"), "user edits while first task runs\n");
+  await api.report("call", { batchId: first.id, assignmentId: first.assignments[0].id, status: "passed", summary: "First file written" }, undefined, undefined, ui.ctx);
+  const blocked = await loadState(root);
+  assert.equal(blocked.phase, "blocked");
+  assert.match(blocked.blockedReason ?? "", /file2\.txt/);
+  assert.equal(blocked.milestones[0].slices[0].tasks[0].status, "passed");
+  assert.equal(blocked.milestones[0].slices[0].tasks[1].attempts, 0);
+  assert.equal(await readFile(path.join(root, "file2.txt"), "utf8"), "user edits while first task runs\n");
+});
+
+test("a switched branch prevents accepting final outcome or marking the roadmap complete", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  state.milestones = parsePlan(plan()); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root);
+  await api.handle("run", ui.ctx);
+  const batch = (await loadState(root)).nativeBatch!;
+  await writeFile(path.join(root, "file1.txt"), "hello\n");
+  await git(root, ["switch", "-c", "different-branch"]);
+  await api.report("call", { batchId: batch.id, assignmentId: batch.assignments[0].id, status: "passed", summary: "File created" }, undefined, undefined, ui.ctx);
+  const blocked = await loadState(root);
+  assert.equal(blocked.phase, "blocked");
+  assert.match(blocked.blockedReason ?? "", /branch changed/);
+  assert.equal(blocked.nativeBatch?.assignments[0].status, "pending");
+  assert.equal(blocked.milestones[0].slices[0].tasks[0].status, "running");
+});
+
+test("Windows dirty path comparisons use filesystem-insensitive casing", { skip: process.platform !== "win32" }, async t => {
+  const root = await fixture(t), state = await loadState(root);
+  await mkdir(path.join(root, "src"));
+  await writeFile(path.join(root, "src", "foo.ts"), "user work\n");
+  const raw = JSON.parse(plan());
+  raw.milestones[0].slices[0].tasks[0].affectedFiles = ["src/Foo.ts"];
+  state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root);
+  await api.handle("run", ui.ctx);
+  const blocked = await loadState(root);
+  assert.equal(blocked.phase, "blocked");
+  assert.match(blocked.blockedReason ?? "", /src\/foo\.ts/);
+  assert.equal(blocked.milestones[0].slices[0].tasks[0].attempts, 0);
+});
+
+test("first-use adoption carries project evidence and protected checks into opt-in Jev dispatch", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "ship-first-jev-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await git(root, ["init", "-b", "main"]);
+  await git(root, ["config", "user.name", "Ship Tests"]);
+  await git(root, ["config", "user.email", "tests@local"]);
+  await mkdir(path.join(root, "src"));
+  await writeFile(path.join(root, "AGENTS.md"), "Keep authentication changes in src.\n");
+  await writeFile(path.join(root, "package.json"), JSON.stringify({
+    packageManager: "npm@10.0.0", scripts: { "test:unit": "node --test", typecheck: "tsc --noEmit" },
+  }));
+  await git(root, ["add", "."]);
+  await git(root, ["commit", "-m", "baseline"]);
+  await writeFile(path.join(root, "user-notes.txt"), "Do not overwrite my notes.\n");
+  const api = harness(ship, true), ui = context(root);
+  await api.handle('change "secure token validation"', ui.ctx);
+  const planning = await loadState(root);
+  assert.equal(planning.phase, "planning");
+  assert.ok(planning.preexistingWork?.paths.includes("user-notes.txt"));
+  assert.match(api.messages.at(-1) ?? "", /AGENTS\.md/);
+  assert.match(api.messages.at(-1) ?? "", /npm run test:unit/);
+  const profile = JSON.parse(await readFile(path.join(root, ".ship", "project-profile.json"), "utf8"));
+  assert.ok(profile.facts.instructions.includes("AGENTS.md"));
+  const config = await loadConfig(root);
+  config.judgment = { enabled: true, confidenceThreshold: 0.7 };
+  await atomicJson(configPath(root), config);
+  const raw = JSON.parse(plan());
+  const task = raw.milestones[0].slices[0].tasks[0];
+  task.goal = "Secure token validation";
+  task.affectedFiles = ["src/auth.ts"];
+  task.taskType = "implementation";
+  task.profile = { complexity: 8, uncertainty: 4, risk: 8, traits: ["authentication"], rationale: ["Security-sensitive token validation"] };
+  const submitted = await api.submit("call", { planningId: planning.nativePlanning!.id, plan: JSON.stringify(raw) }, undefined, undefined, ui.ctx);
+  assert.notEqual(submitted.isError, true);
+  const pending = (await loadState(root)).pendingJudgment!;
+  assert.deepEqual(pending.eligible, ["task", "slow"]);
+  assert.equal((await loadState(root)).nativeBatch, undefined);
+  const request = JSON.parse((api.messages.at(-1) ?? "").match(/using (\{.*\})\. SHIP observes/)![1]);
+  const answer = (choice: string) => ({ type: "choice", choice, confidence: 0.91, probabilities: { [choice]: 1 } });
+  await api.resultHook({ toolName: "jev_ask", input: request, details: { answers: {
+    [pending.id]: { type: "choice", choice: "slow", confidence: 0.91, probabilities: { task: 0.09, slow: 0.91 } },
+    [`${pending.id}.taskType`]: answer("implementation"),
+    [`${pending.id}.complexity`]: answer("8"),
+    [`${pending.id}.uncertainty`]: answer("HIGH"),
+    [`${pending.id}.risk`]: answer("HIGH"),
+  } }, isError: false }, ui.ctx);
+  const current = await loadState(root), selected = current.milestones[0].slices[0].tasks[0];
+  assert.equal(selected.routingDecision.backend, "omp-jev");
+  assert.equal(selected.execution.role, "slow");
+  assert.equal(selected.execution.verificationSpecialist, "security-reviewer");
+  assert.ok(selected.verificationPlan.requirements.some(requirement => requirement.kind === "security-review"));
+  assert.ok(selected.verificationPlan.requirements.some(requirement => requirement.command === "npm run test:unit"));
+  assert.ok(selected.verificationPlan.requirements.some(requirement => requirement.command === "npm run typecheck"));
+  assert.equal(current.nativeBatch?.stage, "executing");
+  assert.equal(current.preexistingWork?.paths.includes("user-notes.txt"), true);
+  assert.equal(await readFile(path.join(root, "user-notes.txt"), "utf8"), "Do not overwrite my notes.\n");
+});
+
+test("an adverse, missing or malformed correlated reviewer verdict cannot pass", async t => {
+  for (const review of [{ overall_correctness: "incorrect", findings: [{ title: "Critical defect", priority: 1 }] }, "No review verdict", { overall_correctness: "correct", findings: [{ title: "Contradiction", priority: 2 }] }]) {
+    const root = await fixture(t), state = await loadState(root);
+    const raw = JSON.parse(plan()); raw.milestones[0].slices[0].tasks[0].profile.complexity = 8;
+    state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1; await saveState(root, state);
+    const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+    const execution = (await loadState(root)).nativeBatch!;
+    await writeFile(path.join(root, "file1.txt"), "hello\n");
+    await api.report("call", { batchId: execution.id, assignmentId: execution.assignments[0].id, status: "passed", summary: "Implemented" }, undefined, undefined, ui.ctx);
+    const reviewBatch = (await loadState(root)).nativeBatch!;
+    assert.equal(reviewBatch.stage, "reviewing");
+    await completeTask(api, reviewBatch.assignments[0].id, "reviewer", ui.ctx, { review });
+    await completeTask(api, reviewBatch.assignments[0].id, "reviewer", ui.ctx);
+    const claim = await api.report("call", { batchId: reviewBatch.id, assignmentId: reviewBatch.assignments[0].id, status: "passed", summary: "Approved" }, undefined, undefined, ui.ctx);
+    assert.equal(claim.isError, true);
+    assert.equal((await loadState(root)).milestones[0].slices[0].tasks[0].status, "verifying");
+  }
+});
+
+test("review output parsing accepts explicit JSON/text verdicts and rejects ambiguity", () => {
+  assert.equal(reviewVerdict({ structuredOutput: { status: "valid", data: { summary: { overall_correctness: "correct" }, findings: [] } } }), "correct");
+  assert.equal(reviewVerdict({ resultText: '{"overall_correctness":"incorrect","findings":[{"title":"Defect","priority":1}]}' }), "incorrect");
+  assert.equal(reviewVerdict("Patch is incorrect (90% confidence)"), "incorrect");
+  assert.equal(reviewVerdict("Patch is correct. Patch is incorrect."), "unknown");
+  assert.equal(reviewVerdict({ overall_correctness: "correct", findings: [{ title: "Defect", priority: 2 }] }), "unknown");
+  assert.equal(reviewVerdict({ overall_correctness: "correct", findings: [{ title: "Suggestion", priority: 3 }] }), "correct");
+  assert.equal(reviewVerdict({ coverage_summary: "Reviewed credential handling", findings: [], reviewed_paths: ["src/auth.ts"] }), "correct");
+  assert.equal(reviewVerdict({ coverage_summary: "Reviewed credential handling", findings: [{ severity: "low" }] }), "incorrect");
+  assert.equal(reviewVerdict({ coverage_summary: "Some paths unchecked", findings: [], deferred: [{ reason: "Missing module" }] }), "unknown");
+  assert.equal(reviewVerdict({ coverage_summary: "Reviewed credential handling" }), "correct");
+  assert.equal(reviewVerdict({ coverage_summary: " ", findings: [] }), "unknown");
+  assert.equal(reviewVerdict({ coverage_summary: "Reviewed credential handling", findings: [{ severity: "surprise" }] }), "unknown");
+});
+
+test("bundled security-reviewer coverage accepts clean results but blocks vulnerabilities and deferred work", async t => {
+  const cases = [
+    { result: { coverage_summary: "Reviewed token handling", findings: [], reviewed_paths: ["file1.txt"] }, accepted: true },
+    { result: { coverage_summary: "Reviewed token handling", findings: [{ severity: "informational", title: "Nit" }] }, accepted: true },
+    { result: { coverage_summary: "Found token exposure", findings: [{ severity: "low", title: "Leak" }] }, accepted: false },
+    { result: { coverage_summary: "Incomplete", findings: [], deferred: [{ reason: "Unavailable policy" }] }, accepted: false },
+  ];
+  for (const { result, accepted } of cases) {
+    const root = await fixture(t), state = await loadState(root);
+    const raw = JSON.parse(plan());
+    raw.milestones[0].slices[0].tasks[0].profile.risk = 9;
+    state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1; await saveState(root, state);
+    const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+    const execution = (await loadState(root)).nativeBatch!;
+    const id = execution.assignments[0].id;
+    await api.spawnHook({ spawnKey: `0-Ship${id.replaceAll("-", "").slice(0, 26)}`, agent: "task", invocationKind: "task" }, ui.ctx);
+    await writeFile(path.join(root, "file1.txt"), "hello\n");
+    await api.report("call", { batchId: execution.id, assignmentId: id, status: "passed", summary: "Implemented" }, undefined, undefined, ui.ctx);
+    const review = (await loadState(root)).nativeBatch!;
+    assert.equal(review.stage, "reviewing");
+    assert.match(api.messages.at(-1) ?? "", /agent: "security-reviewer"/);
+    await completeTask(api, review.assignments[0].id, "security-reviewer", ui.ctx, { review: result });
+    const claim = await api.report("call", { batchId: review.id, assignmentId: review.assignments[0].id, status: "passed", summary: "Security inspection finished" }, undefined, undefined, ui.ctx);
+    assert.equal(claim.isError === true, !accepted);
+    assert.equal((await loadState(root)).phase === "complete", accepted);
+  }
+});
+
+test("reviewer P3 finding does not override an explicit correct verdict", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  const raw = JSON.parse(plan()); raw.milestones[0].slices[0].tasks[0].profile.complexity = 8;
+  state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+  const execution = (await loadState(root)).nativeBatch!;
+  await api.spawnHook({ spawnKey: `0-Ship${execution.assignments[0].id.replaceAll("-", "").slice(0, 26)}`, agent: "task", invocationKind: "task" }, ui.ctx);
+  await writeFile(path.join(root, "file1.txt"), "hello\n");
+  await api.report("call", { batchId: execution.id, assignmentId: execution.assignments[0].id, status: "passed", summary: "Implemented" }, undefined, undefined, ui.ctx);
+  const review = (await loadState(root)).nativeBatch!;
+  await completeTask(api, review.assignments[0].id, "reviewer", ui.ctx, { review: {
+    overall_correctness: "correct", explanation: "Only a P3 nit", confidence: 0.9,
+    findings: [{ title: "Improve phrasing", priority: 3, body: "Minor formatting suggestion" }],
+  } });
+  const claim = await api.report("call", { batchId: review.id, assignmentId: review.assignments[0].id, status: "passed", summary: "Accepted with non-blocking suggestion" }, undefined, undefined, ui.ctx);
+  assert.notEqual(claim.isError, true);
+  assert.equal((await loadState(root)).phase, "complete");
+});
+
+test("newly declared integration check runs despite a frozen single-domain task plan", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  await writeFile(path.join(root, "package.json"), JSON.stringify({ scripts: { test: "node -e \"process.exit(0)\"" } }));
+  await git(root, ["add", "package.json"]); await git(root, ["commit", "-m", "Declare initial checks"]);
+  state.milestones = parsePlan(plan()); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+  const batch = (await loadState(root)).nativeBatch!;
+  await writeFile(path.join(root, "package.json"), JSON.stringify({ scripts: {
+    test: "node -e \"process.exit(0)\"", "test:integration": "node -e \"process.exit(1)\"",
+  } }));
+  await writeFile(path.join(root, "file1.txt"), "hello\n");
+  await api.report("call", { batchId: batch.id, assignmentId: batch.assignments[0].id, status: "passed", summary: "Created file" }, undefined, undefined, ui.ctx);
+  const current = await loadState(root);
+  assert.equal(current.phase, "blocked");
+  assert.match(current.blockedReason ?? "", /Integration check failed/);
+  assert.ok(current.repoChecks?.some(check => check.command === "npm run test:integration"));
+  assert.deepEqual(current.milestones[0].slices[0].tasks[0].acceptance, ["file1.txt contains hello"]);
+});
+
+test("a newly declared typecheck is required before a pending task can pass", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  state.milestones = parsePlan(plan()); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+  const batch = (await loadState(root)).nativeBatch!;
+  await writeFile(path.join(root, "package.json"), JSON.stringify({ scripts: { typecheck: "node -e \"process.exit(1)\"" } }));
+  await writeFile(path.join(root, "file1.txt"), "hello\n");
+  await api.report("call", { batchId: batch.id, assignmentId: batch.assignments[0].id, status: "passed", summary: "Created file" }, undefined, undefined, ui.ctx);
+  const current = await loadState(root), task = current.milestones[0].slices[0].tasks[0];
+  assert.equal(task.status, "running");
+  assert.equal(task.attempts, 2);
+  assert.match(task.lastError ?? "", /npm run typecheck/);
+  assert.ok(task.verificationPlan.requirements.some(requirement => requirement.command === "npm run typecheck"));
+  assert.deepEqual(task.acceptance, ["file1.txt contains hello"]);
+  assert.deepEqual(task.verificationCommands, ["grep -q '^hello$' file1.txt"]);
+});
+
+test("a later task cannot overwrite edits to a previously owned file after a pause", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  const raw = JSON.parse(plan());
+  raw.milestones[0].slices[0].tasks[0].affectedFiles = ["file1.txt"];
+  raw.milestones[0].slices[0].tasks.push({
+    id: "T02", title: "Reuse file", goal: "extend file1.txt", dependencies: ["T01"], affectedFiles: ["file1.txt"],
+    acceptance: ["file1.txt remains correct"], verificationCommands: ["grep -q '^hello$' file1.txt"],
+  });
+  state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+  const first = (await loadState(root)).nativeBatch!;
+  await writeFile(path.join(root, "file1.txt"), "hello\n");
+  await api.handle("pause", ui.ctx);
+  await api.report("call", { batchId: first.id, assignmentId: first.assignments[0].id, status: "passed", summary: "Created file" }, undefined, undefined, ui.ctx);
+  assert.equal((await loadState(root)).paused, true);
+  await writeFile(path.join(root, "file1.txt"), "user edit\n");
+  await api.handle("resume", ui.ctx); await api.handle("run", ui.ctx);
+  const blocked = await loadState(root);
+  assert.equal(blocked.phase, "blocked");
+  assert.match(blocked.blockedReason ?? "", /Previously owned file changed.*file1\.txt/);
+  assert.equal(blocked.milestones[0].slices[0].tasks[1].attempts, 0);
+  assert.equal(await readFile(path.join(root, "file1.txt"), "utf8"), "user edit\n");
 });

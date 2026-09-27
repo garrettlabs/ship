@@ -9,6 +9,11 @@ export async function initialize(root: string, briefFile: string): Promise<void>
   if (await exists(shipDir(root))) throw new Error(".ship already exists; refusing to overwrite it");
   const brief = await readFile(path.resolve(root, briefFile), "utf8");
   if (!brief.trim()) throw new Error("Brief is empty");
+  await createProject(root, brief);
+}
+
+async function createProject(root: string, brief: string): Promise<void> {
+  if (await exists(shipDir(root))) throw new Error(".ship already exists; refusing to overwrite it");
   await ensureGitRepo(root);
   await ensureShipExcluded(root);
   // Exclusive creation prevents two sessions from overwriting one another's project.
@@ -27,4 +32,10 @@ export async function initialize(root: string, briefFile: string): Promise<void>
   await atomicJson(configPath(root), config);
   await saveState(root, state);
   await writeRoadmapView(root, state);
+}
+
+/** Adopt an existing checkout in place. The first request is the planning brief. */
+export async function bootstrap(root: string, request: string): Promise<void> {
+  if (!request.trim()) throw new Error("A change request is required to start planning");
+  await createProject(root, request.trim() + "\n");
 }

@@ -78,7 +78,7 @@ export type InboxMessage =
   | { id: string; type: "capture"; note: string; at: string }
   | (RoadmapEdit & { id: string; at: string });
 export interface NativeAssignment {
-  id: string; key: string; status: "pending" | "passed" | "failed" | "partial"; summary?: string; routed?: boolean; specialistDispatched?: boolean;
+  id: string; key: string; status: "pending" | "passed" | "failed" | "partial"; summary?: string; routed?: boolean; specialistDispatched?: boolean; reviewVerdict?: "correct" | "incorrect" | "unknown"; verifiedCommands?: string[];
 }
 export interface NativeBatch {
   id: string; sessionId: string; revision: number; stage: "executing" | "reviewing"; assignments: NativeAssignment[]; settling?: boolean; awaitingBudget?: boolean;
@@ -88,6 +88,10 @@ export interface ShipState {
   schemaVersion: 1; projectName: string; phase: RunPhase; roadmapRevision: number;
   milestones: Milestone[]; current?: { milestoneId: string; sliceId: string; taskId?: string };
   repoChecks?: RepoCheck[];
+  /** Git state observed before SHIP first planned work; never treats these paths as SHIP-owned. */
+  preexistingWork?: { branch: string | null; paths: string[]; truncated?: boolean; unknown?: boolean };
+  /** Content fingerprints of dirty SHIP-owned files at the last settled task boundary. */
+  ownedSnapshots?: Record<string, string>;
   paused: boolean; blockedReason?: string; lastProgressAt: string; createdAt: string; updatedAt: string;
   workspace?: { path: string; branch: string; baseHead: string };
   lastHead?: string; partialTree?: string; activeAttempt?: Attempt; dispatches?: number; planningFailures?: number;
