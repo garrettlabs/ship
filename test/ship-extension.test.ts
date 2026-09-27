@@ -8,18 +8,24 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@o
 import ship, { createShipExtension } from "../extensions/ship.ts";
 import { fixture, plan } from "./helpers.ts";
 import { parsePlan } from "../src/model.ts";
-import { atomicJson, configPath, exists, loadConfig, loadState, saveState } from "../src/store.ts";
+import { plannerPrompt } from "../src/prompts.ts";
+import { atomicJson, configPath, exists, loadConfig, loadState, queueRoadmapEdit, saveState, statePath } from "../src/store.ts";
 
 function harness(extension = ship) {
   let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
   type ToolRunner = (id: string, params: unknown, signal: AbortSignal | undefined, update: undefined, ctx: ExtensionContext) => Promise<{ content: { type: string; text: string }[]; isError?: boolean }>;
   let report: ToolRunner | undefined, submit: ToolRunner | undefined;
   let spawnHook: ((event: { spawnKey?: string; agent: string; invocationKind: "task" }, ctx: ExtensionContext) => Promise<{ model?: string; block?: boolean; reason?: string } | undefined>) | undefined;
+  let resultHook: ((event: { toolName: string; input: Record<string, unknown>; details: unknown; isError: boolean }, ctx: ExtensionContext) => Promise<void>) | undefined;
   const messages: string[] = [];
   const schema = { object: () => ({}), string: () => ({}), enum: () => ({}) };
   extension({
     zod: schema,
-    on(event: string, callback: typeof spawnHook) { assert.equal(event, "before_subagent_spawn"); spawnHook = callback; },
+    on(event: string, callback: typeof spawnHook) {
+      if (event === "before_subagent_spawn") spawnHook = callback;
+      else if (event === "tool_result") resultHook = callback as typeof resultHook;
+      else assert.fail(`Unexpected extension event: ${event}`);
+    },
     registerCommand(name: string, options: { handler: typeof handler }) { assert.equal(name, "ship"); handler = options.handler; },
     registerTool(tool: { name: string; execute: ToolRunner }) {
       if (tool.name === "ship_outcome") report = tool.execute;
@@ -28,10 +34,21 @@ function harness(extension = ship) {
     },
     sendUserMessage(message: string) { messages.push(message); },
   } as unknown as ExtensionAPI);
-  assert.ok(handler); assert.ok(report); assert.ok(submit); assert.ok(spawnHook);
-  return { handle: handler, report: report, submit: submit, spawnHook: spawnHook, messages };
+  assert.ok(handler); assert.ok(report); assert.ok(submit); assert.ok(spawnHook); assert.ok(resultHook);
+  return { handle: handler, report: report, submit: submit, spawnHook: spawnHook, resultHook: resultHook, messages };
 }
 function command(extension = ship) { return harness(extension).handle; }
+async function completeTask(api: { resultHook: (event: { toolName: string; input: Record<string, unknown>; details: unknown; isError: boolean }, ctx: ExtensionContext) => Promise<void> },
+  assignmentId: string, agent: string, ctx: ExtensionContext, options: { status?: "success" | "failed" | "skipped" | "async"; name?: string; resultAgent?: string } = {}) {
+  const name = options.name ?? `Ship${assignmentId.replaceAll("-", "").slice(0, 26)}`;
+  const status = options.status ?? "success";
+  const resultAgent = options.resultAgent ?? agent;
+  await api.resultHook({ toolName: "task", input: { name, agent, task: `Inspect assignment ${assignmentId} acceptance and report findings` }, isError: false,
+    details: status === "skipped" ? { results: [], totalDurationMs: 0 } :
+      status === "async" ? { results: [], async: { state: "running" }, progress: [{ id: name, index: 0, agent, status: "running" }] } :
+        { results: [{ id: name, index: 0, agent: resultAgent, exitCode: status === "failed" ? 1 : 0 }], totalDurationMs: 1 },
+  }, ctx);
+}
 
 function context(cwd: string) {
   const notices: { message: string; type?: string }[] = [];
@@ -298,6 +315,12 @@ test("native verification requires an independent reviewer after successful comm
   assert.equal(review.stage, "reviewing");
   assert.equal(current.milestones[0].slices[0].tasks[0].status, "verifying");
   assert.match(api.messages.at(-1) ?? "", /agent: "reviewer"/);
+  const missingDispatch = await api.report("call", { batchId: review.id, assignmentId: review.assignments[0].id, status: "passed", summary: "Claimed review without dispatch" }, undefined, undefined, ui.ctx);
+  assert.equal(missingDispatch.isError, true);
+  assert.equal((await loadState(root)).milestones[0].slices[0].tasks[0].status, "verifying");
+  const reviewKey = `0-Ship${review.assignments[0].id.replaceAll("-", "").slice(0, 26)}`;
+  assert.equal((await api.spawnHook({ spawnKey: reviewKey, agent: "task", invocationKind: "task" }, ui.ctx))?.block, true);
+  assert.equal((await api.spawnHook({ spawnKey: reviewKey, agent: "reviewer", invocationKind: "task" }, ui.ctx))?.block, undefined);
   await api.report("call", { batchId: review.id, assignmentId: review.assignments[0].id, status: "failed", summary: "Independent reviewer found a concrete defect" }, undefined, undefined, ui.ctx);
   current = await loadState(root);
   assert.notEqual(current.milestones[0].slices[0].tasks[0].status, "passed");
@@ -309,6 +332,8 @@ test("native verification requires an independent reviewer after successful comm
   current = await loadState(root); review = current.nativeBatch!;
   assert.equal(review.stage, "reviewing");
   assert.equal(current.milestones[0].slices[0].tasks[0].status, "verifying");
+  await api.spawnHook({ spawnKey: `0-Ship${review.assignments[0].id.replaceAll("-", "").slice(0, 26)}`, agent: "reviewer", invocationKind: "task" }, ui.ctx);
+  await completeTask(api, review.assignments[0].id, "reviewer", ui.ctx);
   await api.report("call", { batchId: review.id, assignmentId: review.assignments[0].id, status: "passed", summary: "Independent reviewer inspected changes and accepted repair" }, undefined, undefined, ui.ctx);
   current = await loadState(root);
   assert.equal(current.phase, "complete");
@@ -339,12 +364,19 @@ test("queued roadmap changes wait for active native batch to settle", async t =>
   assert.equal(batch.assignments[0].key, "M001/S01/T02");
 });
 
-test("fresh native project plans through OMP before assigning work", async t => {
+test("fresh native project delegates the full JSON planner contract before assigning work", async t => {
   const root = await fixture(t), api = harness(), ui = context(root);
+  const brief = "Build two local files; require a verifiable demo of both.";
+  await writeFile(path.join(root, ".ship", "PROJECT.md"), brief);
   await api.handle("run", ui.ctx);
   const planning = (await loadState(root)).nativePlanning!;
   assert.ok(planning.id);
-  assert.match(api.messages[0], /ship_plan/);
+  const instruction = api.messages[0];
+  assert.match(instruction, /Use OMP task tool agent: "task", name: "ShipPlanner"/);
+  assert.match(instruction, /Pass the entire planner task text below verbatim as the task agent's task prompt/);
+  assert.match(instruction, /final answer, which MUST be raw JSON only \(no Markdown, fences, or commentary\)/);
+  assert.match(instruction, new RegExp(`call ship_plan with planningId ${planning.id} and plan set to that complete raw JSON answer`));
+  assert.equal(instruction.split("PLANNER TASK TEXT (pass everything below verbatim):\n")[1], plannerPrompt(brief));
   assert.equal((await api.submit("call", { planningId: "wrong", plan: plan() }, undefined, undefined, ui.ctx)).isError, true);
   await api.submit("call", { planningId: planning.id, plan: plan() }, undefined, undefined, ui.ctx);
   const state = await loadState(root);
@@ -419,6 +451,8 @@ test("required reviewer remains schedulable after dispatch budget increases", as
   current = await loadState(root); batch = current.nativeBatch!;
   assert.equal(batch.stage, "reviewing");
   assert.equal(batch.awaitingBudget, undefined);
+  await api.spawnHook({ spawnKey: `0-Ship${batch.assignments[0].id.replaceAll("-", "").slice(0, 26)}`, agent: "reviewer", invocationKind: "task" }, ui.ctx);
+  await completeTask(api, batch.assignments[0].id, "reviewer", ui.ctx);
   await api.report("call", { batchId: batch.id, assignmentId: batch.assignments[0].id, status: "passed", summary: "Independent review accepted changes" }, undefined, undefined, ui.ctx);
   assert.equal((await loadState(root)).phase, "complete");
 });
@@ -451,4 +485,191 @@ test("slow review work preserves the reviewer specialist at OMP spawn", async t 
   const key = `0-Ship${batch.assignments[0].id.replaceAll("-", "").slice(0, 26)}`;
   assert.equal((await api.spawnHook({ spawnKey: key, agent: "task", invocationKind: "task" }, ui.ctx))?.block, true);
   assert.equal((await api.spawnHook({ spawnKey: key, agent: "reviewer", invocationKind: "task" }, ui.ctx))?.model, "@slow");
+});
+
+test("lost native worker is never automatically duplicated and explicit dead-worker recovery consumes its attempt", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  state.milestones = parsePlan(plan()); state.roadmapRevision = 1; await saveState(root, state);
+  const first = harness(), ui = context(root); await first.handle("run", ui.ctx);
+  const original = (await loadState(root)).nativeBatch!;
+  const restarted = harness(), newSession = { ...ui.ctx, sessionManager: { getSessionId: () => "restarted" } } as ExtensionCommandContext;
+  await restarted.handle("run", newSession);
+  assert.equal((await loadState(root)).nativeBatch?.id, original.id);
+  ui.confirm(false); await restarted.handle("recover", newSession);
+  assert.equal((await loadState(root)).nativeBatch?.id, original.id);
+  ui.confirm(true); await restarted.handle("recover", newSession);
+  const recovered = await loadState(root);
+  assert.notEqual(recovered.nativeBatch?.id, original.id);
+  assert.equal(recovered.nativeBatch?.sessionId, "restarted");
+  assert.equal(recovered.milestones[0].slices[0].tasks[0].attempts, 2);
+  assert.equal(recovered.dispatches, 2);
+  assert.match(recovered.milestones[0].slices[0].tasks[0].lastError ?? "", /Worker terminated/);
+  assert.equal((await restarted.report("call", { batchId: original.id, assignmentId: original.assignments[0].id, status: "passed", summary: "Late result" }, undefined, undefined, newSession)).isError, true);
+});
+
+test("interrupted native planning cannot be reused by another session without explicit recovery", async t => {
+  const root = await fixture(t), first = harness(), ui = context(root);
+  await first.handle("run", ui.ctx);
+  const original = (await loadState(root)).nativePlanning!;
+  const restarted = harness(), next = { ...ui.ctx, sessionManager: { getSessionId: () => "restarted" } } as ExtensionCommandContext;
+  await restarted.handle("run", next);
+  assert.equal((await loadState(root)).nativePlanning?.id, original.id);
+  await restarted.handle("recover", next);
+  const state = await loadState(root);
+  assert.notEqual(state.nativePlanning?.id, original.id);
+  assert.equal(state.nativePlanning?.sessionId, "restarted");
+  assert.equal(state.planningFailures, 1);
+  assert.equal(state.dispatches, 2);
+  assert.equal((await restarted.submit("call", { planningId: original.id, plan: plan() }, undefined, undefined, next)).isError, true);
+});
+
+test("persisted queued edit applies once after restart recovery, and missing prerequisites reject planning", async t => {
+  const root = await fixture(t), api = harness(), ui = context(root);
+  await api.handle("run", ui.ctx);
+  const planning = (await loadState(root)).nativePlanning!;
+  const invalid = JSON.parse(plan());
+  invalid.milestones[0].slices[0].tasks[0].dependencies = ["T99"];
+  const rejected = await api.submit("call", { planningId: planning.id, plan: JSON.stringify(invalid) }, undefined, undefined, ui.ctx);
+  assert.match(rejected.content[0].text, /planning rejected.*[Dd]ependency|planning rejected.*[Uu]nknown|planning rejected.*T99/s);
+  assert.equal((await loadState(root)).milestones.length, 0);
+  await api.submit("call", { planningId: planning.id, plan: plan() }, undefined, undefined, ui.ctx);
+  const batch = (await loadState(root)).nativeBatch!;
+  // A queued add remains unapplied while the batch is outstanding.
+  await queueRoadmapEdit(root, { type: "add", slice: "M001/S01", title: "Second output", goal: "Create second.txt", acceptance: "second.txt exists", check: "test -f second.txt", revision: 1 });
+  const restarted = harness();
+  await restarted.handle("run", ui.ctx);
+  assert.equal((await loadState(root)).roadmapRevision, 1);
+  await writeFile(path.join(root, "file1.txt"), "hello\n");
+  await restarted.report("call", { batchId: batch.id, assignmentId: batch.assignments[0].id, status: "passed", summary: "Created file1" }, undefined, undefined, ui.ctx);
+  const state = await loadState(root);
+  assert.equal(state.roadmapRevision, 2);
+  assert.equal(state.milestones[0].slices[0].tasks.length, 2);
+  await restarted.handle("run", ui.ctx);
+  assert.equal((await loadState(root)).milestones[0].slices[0].tasks.length, 2);
+});
+
+test("disjoint successful focused checks cannot hide a failing combined integration check", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  const raw = JSON.parse(plan());
+  raw.milestones[0].slices[0].tasks = [1, 2].map(i => ({
+    id: `T0${i}`, title: `Deliver output ${i}`, goal: `Create file${i}.txt`, taskType: "documentation",
+    uncertainty: "LOW", affectedDomains: [`area${i}`], affectedFiles: [`file${i}.txt`, `note${i}.txt`],
+    acceptance: [`file${i}.txt exists`], verificationCommands: [`test -f file${i}.txt`],
+  }));
+  const checks = [{ kind: "integration" as const, command: "test \"$(cat file1.txt)\" = \"$(cat file2.txt)\"", source: "project integration" }];
+  state.repoChecks = checks; state.milestones = parsePlan(JSON.stringify(raw), checks); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+  const batch = (await loadState(root)).nativeBatch!;
+  assert.equal(batch.assignments.length, 2);
+  await writeFile(path.join(root, "file1.txt"), "one\n"); await writeFile(path.join(root, "file2.txt"), "two\n");
+  for (const assignment of batch.assignments) await api.report("call", { batchId: batch.id, assignmentId: assignment.id, status: "passed", summary: "Focused file check succeeds" }, undefined, undefined, ui.ctx);
+  const blocked = await loadState(root);
+  assert.equal(blocked.phase, "blocked");
+  assert.match(blocked.blockedReason ?? "", /Integration check failed/);
+  assert.ok(blocked.milestones[0].slices[0].tasks.every(task => task.status === "passed"));
+  await writeFile(path.join(root, "file2.txt"), "one\n");
+  await api.handle("resume", ui.ctx); await api.handle("run", ui.ctx);
+  assert.equal((await loadState(root)).phase, "complete");
+});
+
+test("malformed persisted native batches and planning records reject before dispatch or outcomes", async t => {
+  const root = await fixture(t), initial = await loadState(root);
+  initial.milestones = parsePlan(plan()); initial.roadmapRevision = 1; await saveState(root, initial);
+  const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+  const good = await loadState(root);
+  const malformed = [
+    (s: typeof good) => { Object.assign(s, { phase: "unknown" }); },
+    (s: typeof good) => { Object.assign(s.nativeBatch!, { assignments: null }); },
+    (s: typeof good) => { Object.assign(s.nativeBatch!.assignments, { 0: null }); },
+    (s: typeof good) => { s.nativeBatch!.assignments[0].key = "M001/S01/T99"; },
+    (s: typeof good) => { s.nativeBatch!.revision++; },
+    (s: typeof good) => { s.nativeBatch!.assignments[0].status = "passed"; },
+    (s: typeof good) => { s.nativeBatch!.awaitingBudget = true; },
+  ];
+  for (const corrupt of malformed) {
+    const s = structuredClone(good); corrupt(s); await atomicJson(statePath(root), s);
+    await assert.rejects(loadState(root), /Invalid persisted native state/);
+    const result = await api.report("call", { batchId: good.nativeBatch!.id, assignmentId: good.nativeBatch!.assignments[0].id, status: "passed", summary: "Claim" }, undefined, undefined, ui.ctx);
+    assert.equal(result.isError, true);
+  }
+  const planning = structuredClone(good);
+  delete planning.nativeBatch; planning.milestones = []; planning.phase = "planning";
+  planning.nativePlanning = { id: "planner", sessionId: "test-session", attempts: -1 };
+  await atomicJson(statePath(root), planning);
+  await assert.rejects(loadState(root), /Invalid persisted native state: planning assignment/);
+});
+
+test("unavailable or wrong named specialist cannot be claimed as a successful dispatch", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  const raw = JSON.parse(plan()); raw.milestones[0].slices[0].tasks[0].taskType = "review";
+  state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+  const batch = (await loadState(root)).nativeBatch!;
+  const key = `0-Ship${batch.assignments[0].id.replaceAll("-", "").slice(0, 26)}`;
+  const unconfigured = { ...ui.ctx, models: { resolve: () => undefined } } as unknown as ExtensionContext;
+  assert.equal((await api.spawnHook({ spawnKey: key, agent: "reviewer", invocationKind: "task" }, unconfigured))?.block, true);
+  assert.equal((await api.spawnHook({ spawnKey: key, agent: "task", invocationKind: "task" }, ui.ctx))?.block, true);
+  const claimed = await api.report("call", { batchId: batch.id, assignmentId: batch.assignments[0].id, status: "passed", summary: "No specialist available" }, undefined, undefined, ui.ctx);
+  assert.equal(claimed.isError, true);
+  assert.equal((await loadState(root)).nativeBatch?.assignments[0].status, "pending");
+});
+
+test("later spawn block, skipped or failed task results cannot pass review; only the correct completed specialist can", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  const raw = JSON.parse(plan()); raw.milestones[0].slices[0].tasks[0].taskType = "review";
+  state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+  const batch = (await loadState(root)).nativeBatch!, assignment = batch.assignments[0];
+  const key = `0-Ship${assignment.id.replaceAll("-", "").slice(0, 26)}`;
+  assert.equal((await api.spawnHook({ spawnKey: key, agent: "reviewer", invocationKind: "task" }, ui.ctx))?.block, undefined);
+  const claim = () => api.report("call", { batchId: batch.id, assignmentId: assignment.id, status: "passed", summary: "Accepted work" }, undefined, undefined, ui.ctx);
+  assert.equal((await claim()).isError, true, "a subsequent extension can block a proposed spawn");
+  await completeTask(api, assignment.id, "reviewer", ui.ctx, { status: "skipped" });
+  assert.equal((await claim()).isError, true);
+  await completeTask(api, assignment.id, "reviewer", ui.ctx, { status: "failed" });
+  assert.equal((await claim()).isError, true);
+  await completeTask(api, assignment.id, "task", ui.ctx, { resultAgent: "task" });
+  await completeTask(api, assignment.id, "reviewer", ui.ctx, { resultAgent: "task" });
+  await completeTask(api, assignment.id, "reviewer", ui.ctx, { name: "Ship" + "0".repeat(26) });
+  assert.equal((await claim()).isError, true);
+  await completeTask(api, assignment.id, "reviewer", ui.ctx, { status: "async" });
+  assert.equal((await claim()).isError, true, "an async launch is not a completed child");
+  await api.resultHook({ toolName: "wait", input: {}, details: { jobs: [{ id: key.slice(2), type: "task", status: "failed" }] }, isError: false }, ui.ctx);
+  assert.equal((await claim()).isError, true);
+  await completeTask(api, assignment.id, "reviewer", ui.ctx, { status: "async" });
+  await api.resultHook({ toolName: "wait", input: {}, details: { jobs: [{ id: key.slice(2), type: "task", status: "completed" }] }, isError: false }, ui.ctx);
+  await writeFile(path.join(root, "file1.txt"), "hello\n");
+  assert.notEqual((await claim()).isError, true);
+  assert.equal((await loadState(root)).phase, "complete");
+});
+
+test("recover keeps a budget-blocked review valid and resumable after raising the budget", async t => {
+  const root = await fixture(t), state = await loadState(root), config = await loadConfig(root);
+  config.limits.maxDispatches = 1; await atomicJson(configPath(root), config);
+  const raw = JSON.parse(plan()); raw.milestones[0].slices[0].tasks[0].uncertainty = "HIGH";
+  state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+  let batch = (await loadState(root)).nativeBatch!;
+  await api.spawnHook({ spawnKey: `0-Ship${batch.assignments[0].id.replaceAll("-", "").slice(0, 26)}`, agent: "task", invocationKind: "task" }, ui.ctx);
+  await writeFile(path.join(root, "file1.txt"), "hello\n");
+  await api.report("call", { batchId: batch.id, assignmentId: batch.assignments[0].id, status: "passed", summary: "Created file" }, undefined, undefined, ui.ctx);
+  const blocked = (await loadState(root)).nativeBatch!;
+  assert.equal(blocked.awaitingBudget, true);
+  const next = { ...ui.ctx, sessionManager: { getSessionId: () => "recovered-session" } } as ExtensionCommandContext;
+  await api.handle("recover", next);
+  const recovered = await loadState(root);
+  assert.equal(recovered.nativeBatch?.id, blocked.id);
+  assert.equal(recovered.nativeBatch?.sessionId, "recovered-session");
+  assert.equal(recovered.nativeBatch?.assignments[0].status, "pending");
+  assert.equal(recovered.nativeBatch?.settling, undefined);
+  assert.equal(recovered.dispatches, 1);
+  await api.handle("run", next);
+  config.limits.maxDispatches = 2; await atomicJson(configPath(root), config);
+  await api.handle("resume", next); await api.handle("run", next);
+  batch = (await loadState(root)).nativeBatch!;
+  assert.equal(batch.stage, "reviewing");
+  await completeTask(api, batch.assignments[0].id, "reviewer", next);
+  const reported = await api.report("call", { batchId: batch.id, assignmentId: batch.assignments[0].id, status: "passed", summary: "Reviewed actual work" }, undefined, undefined, next);
+  assert.notEqual(reported.isError, true);
+  assert.equal((await loadState(root)).phase, "complete");
 });

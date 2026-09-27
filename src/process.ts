@@ -1,6 +1,7 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { hostname } from "node:os";
 import { fileURLToPath } from "node:url";
+import { accessSync, constants, statSync } from "node:fs";
 import { unlink, open } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -43,9 +44,35 @@ export async function assertNoProcess(root: string): Promise<void> {
   if (record.host !== hostname() || await treeRunning(record.pid, record.token)) throw new Error(`Verification group ${record.pid} may still be alive. Refusing overlapping checks; inspect it before recovery.`);
   await unlink(file);
 }
+function nodeExecutable(): string {
+  const executable = process.platform === "win32" ? "node.exe" : "node";
+  const usable = (file: string): boolean => {
+    try {
+      if (!statSync(file).isFile()) return false;
+      accessSync(file, constants.X_OK);
+      return true;
+    } catch { return false; }
+  };
+  const configured = process.env.NODE_BINARY;
+  if (configured) {
+    if (path.isAbsolute(configured) && usable(configured)) return configured;
+    throw new Error(`NODE_BINARY must point to an executable Node.js binary: ${configured}`);
+  }
+  if (path.basename(process.execPath).toLowerCase() === executable && usable(process.execPath)) return process.execPath;
+  // A packaged OMP binary is not a Node executable, even though execPath
+  // points to it. Resolve an actual Node binary without consulting cwd.
+  const pathKey = Object.keys(process.env).find(key => key.toLowerCase() === "path");
+  for (const directory of (pathKey ? process.env[pathKey] : "")?.split(path.delimiter) ?? []) {
+    if (!path.isAbsolute(directory)) continue;
+    const candidate = path.join(directory, executable);
+    if (usable(candidate)) return candidate;
+  }
+  throw new Error("Node.js executable not found for verification supervisor; install Node.js on PATH or set NODE_BINARY to its absolute path");
+}
+
 async function startCheckProcess(command: string, cwd: string, root: string) {
   await assertNoProcess(root);
-  const child = spawn(process.execPath, [fileURLToPath(new URL("./process-host.mjs", import.meta.url))], {
+  const child = spawn(nodeExecutable(), [fileURLToPath(new URL("./process-host.mjs", import.meta.url))], {
     cwd, detached: true, windowsHide: true, stdio: ["pipe", "pipe", "pipe", "ipc"], env: process.env,
   }) as ChildProcessWithoutNullStreams;
   child.stdin.on("error", () => {});
