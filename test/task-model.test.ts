@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { parsePlan, applyRoadmapEdit, applyReview } from "../src/model.ts";
 import { atomicJson, loadState, saveState, statePath } from "../src/store.ts";
 import { fixture, plan } from "./helpers.ts";
+import { routeTask } from "../src/role-router.ts";
 
 function task(overrides: Record<string, unknown> = {}) {
   const raw = JSON.parse(plan());
@@ -28,6 +29,51 @@ test("classification distinguishes structural complexity independently of safety
   assert.equal(migration.complexity, "COMPLEX"); assert.equal(migration.risk, "HIGH");
   assert.deepEqual(migration.classificationSignals, ["migration/schema", "persisted data", "filesystem deletion"]);
   assert.equal(migration.executionRoute, "decompose");
+});
+
+test("role router selects scout, direct, delegated, planning and difficult-reasoning work", () => {
+  const recon = task({ taskType: "reconnaissance", objective: "Inspect repository layout" });
+  assert.deepEqual([recon.execution.mode, recon.execution.role, recon.execution.specialist], ["delegate", "smol", "scout"]);
+  const local = task({ taskType: "implementation", title: "Tiny obvious local edit", goal: "Change one line" });
+  assert.deepEqual([local.execution.mode, local.execution.role], ["main", "main"]);
+  const normal = task({ taskType: "implementation", title: "Implement result", goal: "Implement the requested behavior" });
+  assert.deepEqual([normal.execution.mode, normal.execution.role], ["delegate", "task"]);
+  const design = task({ taskType: "planning-design", uncertainty: "HIGH", objective: "Design architecture" });
+  assert.equal(design.execution.role, "plan");
+  const hard = task({ taskType: "implementation", uncertainty: "HIGH", affectedFiles: ["a", "b", "c", "d"] });
+  assert.equal(hard.execution.role, "slow");
+  assert.match(hard.execution.reason, /uncertainty/);
+  assert.ok(normal.execution.reason);
+  for (const routed of [recon, local, normal, design, hard]) {
+    assert.equal("provider" in routed.execution, false);
+    assert.equal("model" in routed.execution, false);
+  }
+});
+
+test("reviews use specialists while sensitive implementation keeps its writer role", () => {
+  const review = task({ taskType: "review", objective: "Review implementation independently" });
+  assert.deepEqual([review.execution.role, review.execution.specialist], ["slow", "reviewer"]);
+  const securityReview = task({ taskType: "security-review", objective: "Audit authentication" });
+  assert.deepEqual([securityReview.execution.role, securityReview.execution.specialist], ["slow", "security-reviewer"]);
+  const sensitive = task({ taskType: "implementation", objective: "Implement authentication permissions", goal: "Implement scoped authentication behavior" });
+  assert.equal(sensitive.risk, "HIGH");
+  assert.equal(sensitive.execution.role, "task");
+  assert.equal(sensitive.execution.specialist, undefined);
+  assert.equal(sensitive.execution.verificationSpecialist, "security-reviewer");
+  assert.match(sensitive.execution.reason, /security-focused verification/);
+});
+
+test("prerequisites affect routing without consulting parallel eligibility", () => {
+  const baseline = task({ taskType: "implementation", goal: "Implement bounded result" });
+  const dependent = routeTask({ ...baseline, dependencies: ["T00", "T02"], complexity: "COMPLEX" });
+  assert.equal(dependent.role, "slow");
+  assert.match(dependent.reason, /multiple prerequisites/);
+  const onePrerequisite = routeTask({ ...baseline, dependencies: ["T00"] });
+  assert.equal(onePrerequisite.role, "task");
+  assert.match(onePrerequisite.reason, /prerequisite context/);
+  const safeEdit = task({ taskType: "implementation", title: "Tiny obvious edit", goal: "Change one line" });
+  const withPrerequisite = routeTask({ ...safeEdit, dependencies: ["T00"] });
+  assert.equal(withPrerequisite.role, "task");
 });
 
 test("explicit migration type and verification-only secret boundaries remain high risk", () => {
@@ -67,7 +113,7 @@ test("legacy plan metadata is honest about unknown scope and planner cannot over
   assert.equal(legacy.objective, legacy.goal); assert.equal(legacy.uncertainty, "UNKNOWN");
   assert.equal(legacy.risk, "UNKNOWN"); assert.equal(legacy.executionRoute, "investigate");
   assert.deepEqual(legacy.verificationRequirements, legacy.acceptance);
-  for (const extra of [{ status: "passed" }, { attempts: 99 }, { risk: "LOW" }]) {
+  for (const extra of [{ status: "passed" }, { attempts: 99 }, { risk: "LOW" }, { execution: { mode: "main", role: "main", reason: "override" } }]) {
     const raw = JSON.parse(plan()); Object.assign(raw.milestones[0].slices[0].tasks[0], extra);
     assert.throws(() => parsePlan(JSON.stringify(raw)), /Planner cannot override/);
   }
@@ -84,7 +130,7 @@ test("legacy state normalization preserves active attempt and commits only on sa
   state.activeAttempt = { id: "attempt-3", key: "M001/S01/T01", baseHead: "base", stage: "verifying", commands: ["frozen check"], revision: 6, tree: "tree" };
   const legacy = structuredClone(state);
   const old = legacy.milestones[0].slices[0].tasks[0] as unknown as Record<string, unknown>;
-  for (const key of ["objective", "dependencies", "affectedDomains", "affectedFiles", "taskType", "uncertainty", "verificationRequirements", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute"]) delete old[key];
+  for (const key of ["objective", "dependencies", "affectedDomains", "affectedFiles", "taskType", "uncertainty", "verificationRequirements", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute", "execution"]) delete old[key];
   await atomicJson(statePath(root), legacy);
   const before = await readFile(statePath(root), "utf8");
   const migrated = await loadState(root);
@@ -93,10 +139,14 @@ test("legacy state normalization preserves active attempt and commits only on sa
   assert.equal(migrated.milestones[0].slices[0].tasks[0].status, "verifying");
   assert.equal(migrated.milestones[0].slices[0].tasks[0].attempts, 3);
   assert.equal(migrated.milestones[0].slices[0].tasks[0].objective, old.goal);
+  assert.equal(migrated.milestones[0].slices[0].tasks[0].execution.role, "task");
   await saveState(root, migrated);
   const reloaded = await loadState(root);
   assert.deepEqual(reloaded.activeAttempt, legacy.activeAttempt);
   assert.deepEqual(reloaded.milestones[0].slices[0].tasks[0], migrated.milestones[0].slices[0].tasks[0]);
+  const tamperedRoute = structuredClone(reloaded); tamperedRoute.milestones[0].slices[0].tasks[0].execution.reason = "manual override";
+  await atomicJson(statePath(root), tamperedRoute);
+  await assert.rejects(loadState(root), /Invalid persisted execution/);
   const corrupted = structuredClone(reloaded); corrupted.milestones[0].slices[0].tasks[0].risk = "LOW";
   await atomicJson(statePath(root), corrupted);
   await assert.rejects(loadState(root), /Invalid persisted risk/);
@@ -112,8 +162,10 @@ test("goal-only edits retain stable objectives, acceptance, checks, and refreshe
   assert.deepEqual(updated.acceptance, initial.acceptance);
   assert.deepEqual(updated.verificationCommands, initial.verificationCommands);
   assert.equal(updated.risk, "HIGH");
+  assert.equal(updated.execution.verificationSpecialist, "security-reviewer");
   applyReview(state, JSON.stringify({ revision: 2, rationale: "implementation revision", lessons: [], changes: [{ task: "M001/S01/T01", goal: "implement using local file", reason: "evidence" }] }), "test");
   assert.equal(updated.objective, initial.objective); assert.equal(updated.risk, "UNKNOWN");
+  assert.equal(updated.execution.verificationSpecialist, undefined);
   applyRoadmapEdit(state, { type: "add", slice: "M001/S01", title: "Second result", goal: "produce second result", acceptance: "second result works", check: "test -f second", revision: 3 });
   assert.equal(state.milestones[0].slices[0].tasks[1].objective, "produce second result");
 });

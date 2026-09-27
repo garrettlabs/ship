@@ -1,5 +1,6 @@
 import type { Milestone, Review, RoadmapEdit, ShipState, Task, TaskType, TaskUncertainty } from "./types.ts";
 import { classifyTask } from "./task-classification.ts";
+import { routeTask } from "./role-router.ts";
 import { DependencyGraph } from "./dependency-graph.ts";
 
 function object(x: unknown): asserts x is Record<string, unknown> {
@@ -20,7 +21,7 @@ function optionalStrings(x: unknown, name: string): asserts x is string[] | unde
 function taskMetadata(task: Record<string, unknown>, fromPlan: boolean): Task {
   object(task); id(task.id, "T"); text(task.title, "task title"); text(task.goal, "goal");
   strings(task.acceptance, "acceptance", true); strings(task.verificationCommands, "verificationCommands", true);
-  if (fromPlan && ["status", "attempts", "lastError", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute"].some(key => key in task)) throw new Error("Planner cannot override task lifecycle or classification");
+  if (fromPlan && ["status", "attempts", "lastError", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute", "execution"].some(key => key in task)) throw new Error("Planner cannot override task lifecycle or classification");
   if (task.objective !== undefined) text(task.objective, "objective");
   optionalStrings(task.dependencies, "dependencies"); optionalStrings(task.affectedDomains, "affectedDomains");
   optionalStrings(task.affectedFiles, "affectedFiles"); optionalStrings(task.verificationRequirements, "verificationRequirements");
@@ -42,6 +43,7 @@ function taskMetadata(task: Record<string, unknown>, fromPlan: boolean): Task {
     complexity: classification.complexity, risk: classification.risk,
     classificationSignals: classification.signals, classificationRationale: classification.rationale,
     parallelEligible: classification.parallelEligible, executionRoute: classification.executionRoute,
+    execution: routeTask({ ...normalized, complexity: classification.complexity, risk: classification.risk }),
   };
   for (const key of Object.keys(computed) as (keyof typeof computed)[]) {
     if (!fromPlan && task[key] !== undefined && JSON.stringify(task[key]) !== JSON.stringify(computed[key])) throw new Error(`Invalid persisted ${key}`);
@@ -125,7 +127,7 @@ export function applyRoadmapEdit(state: ShipState, edit: RoadmapEdit): void {
     const entry = plan.flatMap(m => m.slices.flatMap(s => s.tasks.map(t => ({ key: `${m.id}/${s.id}/${t.id}`, t })))).find(x => x.key === edit.task);
     if (!entry) throw new Error(`Unknown task: ${edit.task}`);
     if (entry.t.status !== "pending" || entry.t.attempts !== 0) throw new Error(`Task ${edit.task} has already started`);
-    Object.assign(entry.t, taskMetadata({ ...entry.t, goal: edit.goal, complexity: undefined, risk: undefined, classificationSignals: undefined, classificationRationale: undefined, parallelEligible: undefined, executionRoute: undefined }, false));
+    Object.assign(entry.t, taskMetadata({ ...entry.t, goal: edit.goal, complexity: undefined, risk: undefined, classificationSignals: undefined, classificationRationale: undefined, parallelEligible: undefined, executionRoute: undefined, execution: undefined }, false));
   }
   validatePlan(plan);
   state.milestones = plan;
@@ -161,7 +163,7 @@ export function applyReview(state: ShipState, output: string, source: string): R
   const review = raw as unknown as Review;
   for (const change of review.changes) {
     const task = tasks(state).find(t => t.key === change.task)!.t;
-    Object.assign(task, taskMetadata({ ...task, goal: change.goal, complexity: undefined, risk: undefined, classificationSignals: undefined, classificationRationale: undefined, parallelEligible: undefined, executionRoute: undefined }, false));
+    Object.assign(task, taskMetadata({ ...task, goal: change.goal, complexity: undefined, risk: undefined, classificationSignals: undefined, classificationRationale: undefined, parallelEligible: undefined, executionRoute: undefined, execution: undefined }, false));
   }
   state.knowledge ??= [];
   for (const lesson of review.lessons) state.knowledge.push({ ...lesson, id: `K${String(state.knowledge.length + 1).padStart(4, "0")}`, source: "agent", evidence: `${source}: ${lesson.evidence}`, at: new Date().toISOString() });
