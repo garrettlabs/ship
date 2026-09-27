@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { DependencyGraph } from "./dependency-graph.ts";
-import { tasks, refresh, parsePlan } from "./model.ts";
+import { tasks, refresh, parsePlan, recomputeJudgedTask } from "./model.ts";
 import { plannerPrompt } from "./prompts.ts";
 import { runCheck } from "./process.ts";
 import { acquireLock } from "./lock.ts";
@@ -10,6 +10,11 @@ import { discoverRepoChecks } from "./verification.ts";
 import { appendEvent, atomicJson, consumeInbox, loadConfig, loadState, saveState, shipDir, writeRoadmapView } from "./store.ts";
 import { assertNoProcess } from "./process.ts";
 import type { Milestone, NativeAssignment, NativeBatch, RepoCheck, ShipConfig, ShipState } from "./types.ts";
+import { applyDecision, confidenceThreshold, eligibleRoles, fallback, hashJudgmentRequest, judgmentTimeoutMs, parseChoice, parseSemanticAnswers, semanticTaskTypes } from "./judgment.ts";
+import type { ExecutionRole, RoutingDecision } from "./types.ts";
+
+export interface RoleCandidate { role: ExecutionRole; model?: string; pricing?: { input: number; output: number }; capability?: number; estimatedTaskCost?: string; }
+export interface RoutingContext { candidates: RoleCandidate[]; jevAvailable: boolean; }
 
 export interface NativeOutcome { batchId: string; assignmentId: string; status: "passed" | "failed" | "partial"; summary: string; }
 const locks = new Map<string, Promise<void>>();
@@ -62,14 +67,25 @@ function chooseBatch(state: ShipState, config: ShipConfig, sessionId: string): N
   }
   const capacity = config.limits.maxDispatches - (state.dispatches ?? 0);
   const eligible = chosen.filter(node => node.task.attempts < config.limits.maxTaskAttempts).slice(0, capacity);
+  if (config.judgment?.enabled && eligible.some(node => node.task.routingDecision.reason === "disabled")) throw new Error("Cannot dispatch an undecided parallel task");
   if (!eligible.length) return undefined;
   const batch: NativeBatch = { id: randomUUID(), sessionId, revision: state.roadmapRevision, stage: "executing", assignments: eligible.map(node => ({ id: randomUUID(), key: node.key, status: "pending" })) };
   for (const node of eligible) { node.task.attempts++; node.task.status = "running"; }
   state.dispatches = (state.dispatches ?? 0) + eligible.length;
   return batch;
 }
-async function advance(root: string, state: ShipState, config: ShipConfig, sessionId: string): Promise<string> {
+async function advance(root: string, state: ShipState, config: ShipConfig, sessionId: string, routing?: RoutingContext): Promise<string> {
   if (state.paused || state.phase === "blocked") return `SHIP ${state.paused ? "paused" : `blocked: ${state.blockedReason}`}. No assignments dispatched.`;
+  if (state.pendingJudgment) {
+    if (state.pendingJudgment.sessionId !== sessionId) return "SHIP judgment belongs to another OMP session; resume it there.";
+    const timeout = config.judgment?.timeoutMs ?? judgmentTimeoutMs;
+    if (config.judgment?.enabled && Date.now() - state.pendingJudgment.requestedAt < timeout) return `SHIP judgment ${state.pendingJudgment.id} is pending. Call jev_ask once, or ship_judgment with status unavailable if the tool cannot be called.`;
+    const task = tasks(state).find(entry => entry.key === state.pendingJudgment!.key)?.t;
+    const reason = config.judgment?.enabled ? "timeout" : "disabled";
+    if (task) { task.routingDecision = fallback(task, reason); task.execution = applyDecision(task, task.routingDecision); }
+    delete state.pendingJudgment;
+    await persist(root, state, "native_judgment_fallback", { reason });
+  }
   if (state.nativeBatch) {
     const batch = state.nativeBatch;
     if (batch.sessionId !== sessionId) return "SHIP batch belongs to a different OMP session; report outstanding outcomes there.";
@@ -84,7 +100,7 @@ async function advance(root: string, state: ShipState, config: ShipConfig, sessi
       await persist(root, state, "native_review_started", { tasks: batch.assignments.map(r => r.key) });
       return instructions(root, batch, state);
     }
-    return batch.settling || batch.assignments.every(entry => entry.status !== "pending") ? settle(root, state, config, sessionId) : `SHIP batch ${batch.id} is already assigned; report outstanding assignment outcomes before dispatching new work.`;
+    return batch.settling || batch.assignments.every(entry => entry.status !== "pending") ? settle(root, state, config, sessionId, routing) : `SHIP batch ${batch.id} is already assigned; report outstanding assignment outcomes before dispatching new work.`;
   }
   if (!state.milestones.length) {
     if ((state.planningFailures ?? 0) >= config.limits.maxTaskAttempts || (state.dispatches ?? 0) >= config.limits.maxDispatches) {
@@ -119,6 +135,44 @@ async function advance(root: string, state: ShipState, config: ShipConfig, sessi
     state.phase = "complete"; delete state.blockedReason;
     await persist(root, state, "project_completed"); return "SHIP complete: all tasks passed required verification and configured integration checks.";
   }
+  if (config.judgment?.enabled) {
+    const next = new DependencyGraph(state.milestones).readyTasks().find(node => node.task.routingDecision.reason === "disabled");
+    if (next) {
+      const task = next.task;
+      const eligible = eligibleRoles(task, routing?.candidates.map(c => c.role) ?? []);
+      if (!routing?.jevAvailable || eligible.length < 2) {
+        task.routingDecision = fallback(task, !routing?.jevAvailable ? "unavailable" : "unconfigured");
+        task.execution = applyDecision(task, task.routingDecision);
+        await persist(root, state, "native_judgment_fallback", { task: next.key, reason: task.routingDecision.reason });
+        return advance(root, state, config, sessionId, routing);
+      }
+      const id = randomUUID();
+      const criteria = Object.fromEntries(eligible.map(role => [role, `OMP role ${role}; choose for reliable completion at minimum estimated cost`]));
+      const candidates = routing!.candidates.filter(c => eligible.includes(c.role)).map(c => {
+        const estimate = c.pricing ? ((3_000 + task.profile.complexity * 1_000) * c.pricing.input +
+          (700 + task.profile.complexity * 400) * c.pricing.output) / 1_000_000 : undefined;
+        return { ...c, capability: c.role === "smol" ? 3 : c.role === "task" ? 6 : 9,
+          ...(estimate === undefined ? {} : { estimatedTaskCost: estimate < 0.01 ? "under $0.01" :
+            estimate < 0.05 ? "$0.01–$0.05" : estimate < 0.2 ? "$0.05–$0.20" : "over $0.20" }) };
+      });
+      const options = (items: readonly (string | number)[]) => Object.fromEntries(items.map(item => [String(item), String(item)]));
+      const request = {
+        state: { correlation: id, objective: task.objective, type: task.taskType, complexity: task.profile.complexity,
+          uncertainty: task.profile.uncertainty, risk: Math.max(task.profile.risk, task.risk === "HIGH" ? 8 : 1),
+          traits: task.profile.traits, candidates },
+        questions: {
+          [id]: { type: "choice", instructions: "Which eligible OMP role is the lowest-cost option likely to complete this task reliably without unnecessary capability? Select only a listed role.", criteria },
+          [`${id}.taskType`]: { type: "choice", instructions: "Classify semantic task type. Respect the planner objective and explicit safety requirements; do not reinterpret dependencies or verification results.", criteria: options(semanticTaskTypes) },
+          [`${id}.complexity`]: { type: "choice", instructions: "Select task complexity 1–10 based on reasoning, coupling and scope; the planner score is authoritative as a safety floor.", criteria: options([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) },
+          [`${id}.uncertainty`]: { type: "choice", instructions: "Classify uncertainty from available task evidence. Do not erase unknown or high uncertainty from planner evidence.", criteria: options(["LOW", "MEDIUM", "HIGH", "UNKNOWN"]) },
+          [`${id}.risk`]: { type: "choice", instructions: "Classify risk, preserving security, migration and destructive signals; SHIP enforces the deterministic risk floor.", criteria: options(["LOW", "HIGH", "UNKNOWN"]) },
+        },
+      };
+      state.pendingJudgment = { id, sessionId, revision: state.roadmapRevision, key: next.key, requestedAt: Date.now(), eligible, requestHash: hashJudgmentRequest(request) };
+      await persist(root, state, "native_judgment_requested", { task: next.key, id });
+      return `SHIP OMP-native judgment ${id} for ${next.key}. In the MAIN session call the PUBLIC jev_ask tool exactly once using ${JSON.stringify(request)}. SHIP observes the public tool result and advances automatically. If jev_ask is unavailable, disabled, unconfigured, or cannot be called, call ship_judgment with id ${id} and status unavailable. Do not launch assignment work until SHIP issues its next batch.`;
+    }
+  }
   const batch = chooseBatch(state, config, sessionId);
   if (!batch) {
     const graph = new DependencyGraph(state.milestones);
@@ -131,17 +185,17 @@ async function advance(root: string, state: ShipState, config: ShipConfig, sessi
   await persist(root, state, "native_batch_started", { batch: batch.id, tasks: batch.assignments.map(a => a.key) });
   return instructions(root, batch, state);
 }
-export function startNativeRun(root: string, sessionId: string): Promise<string> {
+export function startNativeRun(root: string, sessionId: string, routing?: RoutingContext): Promise<string> {
   return serialized(root, async () => {
     const state = await loadState(root);
     if (state.workspace) throw new Error("Standalone worktree state cannot be reused in OMP's checkout; use a fresh native project");
     if (state.activeAttempt) throw new Error("A standalone controller attempt is active; reconcile it before OMP-native execution");
     await consumeInbox(root, state);
-    return advance(root, state, await loadConfig(root), sessionId);
+    return advance(root, state, await loadConfig(root), sessionId, routing);
   });
 }
 /** Explicit recovery is allowed only after the caller confirms every former OMP worker is dead. */
-export function recoverNativeRun(root: string, sessionId: string): Promise<string> {
+export function recoverNativeRun(root: string, sessionId: string, routing?: RoutingContext): Promise<string> {
   return serialized(root, async () => {
     await assertNoProcess(root);
     const state = await loadState(root), config = await loadConfig(root);
@@ -166,14 +220,20 @@ export function recoverNativeRun(root: string, sessionId: string): Promise<strin
       delete state.nativePlanning;
       state.phase = "idle";
       await persist(root, state, "native_planning_recovered");
+    } else if (state.pendingJudgment) {
+      const pending = state.pendingJudgment;
+      const task = tasks(state).find(entry => entry.key === pending.key)?.t;
+      if (task) { task.routingDecision = fallback(task, "unavailable"); task.execution = applyDecision(task, task.routingDecision); }
+      delete state.pendingJudgment;
+      await persist(root, state, "native_judgment_recovered", { task: pending.key });
     }
     if (state.phase === "blocked" && state.nativeBatch?.awaitingBudget) return `SHIP blocked: ${state.blockedReason}`;
     if (state.phase === "blocked") { state.phase = "idle"; delete state.blockedReason; }
     await consumeInbox(root, state);
-    return advance(root, state, config, sessionId);
+    return advance(root, state, config, sessionId, routing);
   });
 }
-export function submitNativePlan(root: string, sessionId: string, planningId: string, plan: string): Promise<string> {
+export function submitNativePlan(root: string, sessionId: string, planningId: string, plan: string, routing?: RoutingContext): Promise<string> {
   return serialized(root, async () => {
     const state = await loadState(root), config = await loadConfig(root);
     if (state.workspace || state.nativeBatch || state.milestones.length || !state.nativePlanning ||
@@ -183,7 +243,7 @@ export function submitNativePlan(root: string, sessionId: string, planningId: st
     try {
       if (plan.length > 1_000_000) throw new Error("Planning output exceeds 1 MB");
       const checks = await discoverRepoChecks(root);
-      approved = { checks, milestones: parsePlan(plan, checks) };
+      approved = { checks, milestones: parsePlan(plan, checks, true) };
     } catch (error) {
       state.planningFailures = (state.planningFailures ?? 0) + 1;
       if (state.nativePlanning.attempts >= config.limits.maxTaskAttempts || (state.dispatches ?? 0) >= config.limits.maxDispatches) {
@@ -201,7 +261,7 @@ export function submitNativePlan(root: string, sessionId: string, planningId: st
     delete state.nativePlanning;
     state.phase = "idle";
     await persist(root, state, "native_roadmap_created");
-    return advance(root, state, config, sessionId);
+    return advance(root, state, config, sessionId, routing);
   });
 }
 
@@ -267,7 +327,7 @@ async function verify(root: string, state: ShipState, assignment: NativeAssignme
   return true;
 }
 
-async function settle(root: string, state: ShipState, config: ShipConfig, sessionId: string): Promise<string> {
+async function settle(root: string, state: ShipState, config: ShipConfig, sessionId: string, routing?: RoutingContext): Promise<string> {
   const batch = state.nativeBatch!;
   const reviews: NativeAssignment[] = [];
   for (const entry of batch.assignments) {
@@ -283,14 +343,14 @@ async function settle(root: string, state: ShipState, config: ShipConfig, sessio
     state.nativeBatch = { id: randomUUID(), sessionId, revision: state.roadmapRevision, stage: "reviewing", assignments: reviews, awaitingBudget: true };
     state.phase = "idle";
     await persist(root, state, "native_review_required", { tasks: reviews.map(r => r.key) });
-    return advance(root, state, config, sessionId);
+    return advance(root, state, config, sessionId, routing);
   }
   state.phase = "idle";
   await persist(root, state, "native_batch_finished", { batch: batch.id });
   await consumeInbox(root, state);
-  return advance(root, state, config, sessionId);
+  return advance(root, state, config, sessionId, routing);
 }
-export function reportNativeOutcome(root: string, sessionId: string, outcome: NativeOutcome): Promise<string> {
+export function reportNativeOutcome(root: string, sessionId: string, outcome: NativeOutcome, routing?: RoutingContext): Promise<string> {
   return serialized(root, async () => {
     const state = await loadState(root), config = await loadConfig(root);
     const batch = state.nativeBatch;
@@ -314,6 +374,37 @@ export function reportNativeOutcome(root: string, sessionId: string, outcome: Na
     if (batch.assignments.some(entry => entry.status === "pending")) return "Outcome recorded. Await every assignment in the batch before proceeding.";
     batch.settling = true;
     await persist(root, state, "native_batch_settling", { batch: batch.id });
-    return settle(root, state, config, sessionId);
+    return settle(root, state, config, sessionId, routing);
+  });
+}
+
+/** Accept one correlated public OMP tool result (or explicit missing-tool report). */
+export function completeNativeJudgment(root: string, sessionId: string, id: string, status: "result" | "unavailable" | "error" | "malformed", response: unknown, routing?: RoutingContext): Promise<string> {
+  return serialized(root, async () => {
+    const state = await loadState(root), config = await loadConfig(root), pending = state.pendingJudgment;
+    if (!pending || pending.id !== id || pending.sessionId !== sessionId || pending.revision !== state.roadmapRevision) throw new Error("Stale or foreign SHIP judgment");
+    const task = tasks(state).find(entry => entry.key === pending.key)?.t;
+    if (!task || task.status !== "pending") throw new Error("Judgment task is no longer pending");
+    const timedOut = Date.now() - pending.requestedAt >= (config.judgment?.timeoutMs ?? judgmentTimeoutMs);
+    if (status === "result" && config.judgment?.enabled && !timedOut) {
+      task.semanticJudgment = parseSemanticAnswers(response, id, config.judgment?.confidenceThreshold ?? confidenceThreshold, task.taskType);
+      recomputeJudgedTask(task, state.repoChecks);
+    }
+    const current = eligibleRoles(task, routing?.candidates.map(c => c.role) ?? []);
+    const eligible = pending.eligible.filter(role => current.includes(role));
+    const answers = response && typeof response === "object" && "answers" in response && response.answers &&
+      typeof response.answers === "object" && !Array.isArray(response.answers) ? response.answers : undefined;
+    const raw: unknown = answers && Object.hasOwn(answers, id) ? Reflect.get(answers, id) : undefined;
+    const choice = raw && typeof raw === "object" && "type" in raw && raw.type === "choice" ? parseChoice(raw, eligible, config.judgment?.confidenceThreshold ?? confidenceThreshold) : "malformed";
+    const reason = !config.judgment?.enabled ? "disabled" : timedOut ? "timeout" : status !== "result" ? status :
+      eligible.length < 2 ? "unconfigured" : typeof choice === "string" ? choice : undefined;
+    const decision: RoutingDecision = reason ? fallback(task, reason) : choice as RoutingDecision;
+    if (reason === "low-confidence" && raw && typeof raw === "object" && "confidence" in raw &&
+        typeof raw.confidence === "number" && Number.isFinite(raw.confidence) && raw.confidence >= 0 && raw.confidence <= 1) decision.confidence = raw.confidence;
+    task.routingDecision = decision;
+    task.execution = applyDecision(task, decision);
+    delete state.pendingJudgment;
+    await persist(root, state, "native_judgment_completed", { task: pending.key, backend: decision.backend, reason: decision.reason, role: decision.role, confidence: decision.confidence });
+    return advance(root, state, config, sessionId, routing);
   });
 }

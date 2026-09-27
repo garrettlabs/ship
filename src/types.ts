@@ -13,6 +13,30 @@ export interface TaskExecution {
   specialist?: SpecialistIntent;
   verificationSpecialist?: "security-reviewer";
 }
+export interface TaskProfile {
+  complexity: number; uncertainty: number; risk: number; traits: string[];
+  rationale: string[]; source?: "planner" | "derived";
+}
+export interface RoutingDecision {
+  backend: "deterministic" | "omp-jev";
+  role: ExecutionRole;
+  fallbackUsed: boolean;
+  reason?: "disabled" | "unavailable" | "unconfigured" | "timeout" | "error" | "malformed" | "low-confidence" | "ineligible";
+  confidence?: number;
+  probabilities?: Record<string, number>;
+}
+export interface SemanticJudgment {
+  backend: "omp-jev";
+  taskType?: { value: TaskType; confidence: number };
+  complexity?: { value: number; confidence: number };
+  uncertainty?: { value: TaskUncertainty; confidence: number };
+  risk?: { value: TaskRisk; confidence: number };
+  fallbacks?: Partial<Record<"taskType" | "complexity" | "uncertainty" | "risk", "low-confidence" | "malformed" | "ineligible">>;
+}
+export interface PendingJudgment {
+  id: string; sessionId: string; revision: number; key: string; requestedAt: number;
+  eligible: ExecutionRole[]; requestHash: string;
+}
 export type VerificationKind = "focused-tests" | "broader-tests" | "typecheck" | "lint" | "build" | "integration" | "independent-review" | "security-review";
 export interface RepoCheck { kind: Exclude<VerificationKind, "independent-review" | "security-review">; command: string; source: string; }
 export interface VerificationRequirement { kind: VerificationKind; reason: string; command?: string; }
@@ -22,6 +46,7 @@ export interface Task {
   id: string; title: string; objective: string; goal: string; dependencies: string[];
   acceptance: string[]; affectedDomains: string[]; affectedFiles: string[];
   taskType: TaskType; complexity: TaskComplexity; risk: TaskRisk; uncertainty: TaskUncertainty;
+  profile: TaskProfile; routingDecision: RoutingDecision; semanticJudgment?: SemanticJudgment; effectiveTaskType?: TaskType; effectiveUncertainty?: TaskUncertainty;
   classificationSignals: string[]; classificationRationale: string[];
   parallelEligible: boolean; executionRoute: "direct" | "investigate" | "decompose";
   execution: TaskExecution;
@@ -42,6 +67,7 @@ export interface Attempt {
 }
 export interface PlanningHints {
   taskType?: TaskType; uncertainty?: TaskUncertainty; dependencies?: string[];
+  profile?: TaskProfile;
   affectedFiles?: string[]; affectedDomains?: string[]; verificationRequirements?: string[];
 }
 export type RoadmapEdit =
@@ -67,10 +93,12 @@ export interface ShipState {
   lastHead?: string; partialTree?: string; activeAttempt?: Attempt; dispatches?: number; planningFailures?: number;
   nativeBatch?: NativeBatch;
   nativePlanning?: NativePlanning;
+  pendingJudgment?: PendingJudgment;
   knowledge?: Knowledge[]; processedInbox?: string[];
 }
 export interface ShipConfig {
   schemaVersion: 1;
   limits: { maxTaskAttempts: number; maxDispatches: number };
   verificationTimeoutMs?: number; protectedChecks?: string[];
+  judgment?: { enabled: boolean; confidenceThreshold?: number; timeoutMs?: number };
 }

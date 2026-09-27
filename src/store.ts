@@ -56,6 +56,15 @@ function validateNativeState(s: ShipState): void {
       ids.add(a.id); keys.add(a.key);
     }
   }
+  if (s.pendingJudgment !== undefined) {
+    const p = s.pendingJudgment;
+    if (!record(p) || !label(p.id) || !label(p.sessionId) || !label(p.key) || !count(p.revision) ||
+        !label(p.requestHash) || !/^[0-9a-f]{64}$/.test(p.requestHash) ||
+        p.revision !== s.roadmapRevision || !count(p.requestedAt) || !Array.isArray(p.eligible) ||
+        p.eligible.length < 2 || p.eligible.some(role => !["smol", "task", "slow"].includes(role)) ||
+        !tasks(s).some(entry => entry.key === p.key && entry.t.status === "pending") ||
+        s.nativeBatch || s.nativePlanning || s.phase !== "idle") invalid("pending judgment");
+  }
 }
 
 export async function loadState(root: string): Promise<ShipState> {
@@ -73,6 +82,12 @@ export async function loadConfig(root: string): Promise<ShipConfig> {
   if (c.schemaVersion !== 1 || !c.limits) throw new Error("Invalid config.json");
   for (const n of [c.limits.maxTaskAttempts, c.limits.maxDispatches, c.verificationTimeoutMs ?? 300_000]) {
     if (!Number.isSafeInteger(n) || n <= 0) throw new Error("Timeouts and limits must be positive integers");
+  }
+  if (c.judgment !== undefined) {
+    const j = c.judgment;
+    if (!j || typeof j !== "object" || typeof j.enabled !== "boolean" ||
+        (j.confidenceThreshold !== undefined && (typeof j.confidenceThreshold !== "number" || !Number.isFinite(j.confidenceThreshold) || j.confidenceThreshold <= 0 || j.confidenceThreshold > 1)) ||
+        (j.timeoutMs !== undefined && (!Number.isSafeInteger(j.timeoutMs) || j.timeoutMs < 1000 || j.timeoutMs > 120_000))) throw new Error("Invalid judgment configuration");
   }
   strings(c.protectedChecks ?? [], "protectedChecks");
   return c;
@@ -106,9 +121,9 @@ export async function consumeInbox(root: string, state: ShipState): Promise<void
     else if (msg.type === "resume") { state.paused = false; if (state.phase === "blocked") { state.phase = "idle"; delete state.blockedReason; } }
     else if (msg.type === "capture" && typeof msg.note === "string" && msg.note.trim()) state.knowledge.push({ id: `K${String(state.knowledge.length + 1).padStart(4, "0")}`, kind: "capture", text: msg.note, source: "user", evidence: `inbox/${file}`, at: msg.at });
     else if (msg.type === "add" || msg.type === "change") {
-      if (state.activeAttempt || state.nativeBatch || state.nativePlanning) continue;
+      if (state.activeAttempt || state.nativeBatch || state.nativePlanning || state.pendingJudgment) continue;
       try {
-        const allowed = ["id", "type", "at", "goal", "revision", "taskType", "uncertainty", "dependencies", "affectedFiles", "affectedDomains", "verificationRequirements", ...(msg.type === "add" ? ["slice", "title", "acceptance", "check"] : ["task"])];
+        const allowed = ["id", "type", "at", "goal", "revision", "taskType", "uncertainty", "profile", "dependencies", "affectedFiles", "affectedDomains", "verificationRequirements", ...(msg.type === "add" ? ["slice", "title", "acceptance", "check"] : ["task"])];
         if (Object.keys(msg).some(key => !allowed.includes(key))) throw new Error("Roadmap edit contains forbidden fields");
         applyRoadmapEdit(state, msg);
         refresh(state);

@@ -7,35 +7,39 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import ship, { createShipExtension } from "../extensions/ship.ts";
 import { fixture, plan } from "./helpers.ts";
+import { completeNativeJudgment, recoverNativeRun, startNativeRun } from "../src/native-execution.ts";
 import { parsePlan } from "../src/model.ts";
 import { plannerPrompt } from "../src/prompts.ts";
 import { atomicJson, configPath, exists, loadConfig, loadState, queueRoadmapEdit, saveState, statePath } from "../src/store.ts";
 
-function harness(extension = ship) {
+function harness(extension = ship, jev = false) {
   let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
   type ToolRunner = (id: string, params: unknown, signal: AbortSignal | undefined, update: undefined, ctx: ExtensionContext) => Promise<{ content: { type: string; text: string }[]; isError?: boolean }>;
-  let report: ToolRunner | undefined, submit: ToolRunner | undefined;
+  let report: ToolRunner | undefined, submit: ToolRunner | undefined, judgment: ToolRunner | undefined;
   let spawnHook: ((event: { spawnKey?: string; agent: string; invocationKind: "task" }, ctx: ExtensionContext) => Promise<{ model?: string; block?: boolean; reason?: string } | undefined>) | undefined;
-  let resultHook: ((event: { toolName: string; input: Record<string, unknown>; details: unknown; isError: boolean }, ctx: ExtensionContext) => Promise<void>) | undefined;
+  const resultHooks: ((event: { toolName: string; input: Record<string, unknown>; details: unknown; isError: boolean }, ctx: ExtensionContext) => Promise<void>)[] = [];
   const messages: string[] = [];
-  const schema = { object: () => ({}), string: () => ({}), enum: () => ({}) };
+  const schema = { object: () => ({}), string: () => ({}), enum: () => ({}), literal: () => ({}) };
   extension({
+    getAllTools: () => jev ? [{ name: "jev_ask" }] : [],
+    getActiveTools: () => jev ? ["jev_ask"] : [],
     zod: schema,
     on(event: string, callback: typeof spawnHook) {
       if (event === "before_subagent_spawn") spawnHook = callback;
-      else if (event === "tool_result") resultHook = callback as typeof resultHook;
+      else if (event === "tool_result") resultHooks.push(callback as unknown as typeof resultHooks[number]);
       else assert.fail(`Unexpected extension event: ${event}`);
     },
     registerCommand(name: string, options: { handler: typeof handler }) { assert.equal(name, "ship"); handler = options.handler; },
     registerTool(tool: { name: string; execute: ToolRunner }) {
       if (tool.name === "ship_outcome") report = tool.execute;
       else if (tool.name === "ship_plan") submit = tool.execute;
-      else assert.fail(`Unexpected extension tool: ${tool.name}`);
+      else if (tool.name === "ship_judgment") judgment = tool.execute;
     },
     sendUserMessage(message: string) { messages.push(message); },
   } as unknown as ExtensionAPI);
-  assert.ok(handler); assert.ok(report); assert.ok(submit); assert.ok(spawnHook); assert.ok(resultHook);
-  return { handle: handler, report: report, submit: submit, spawnHook: spawnHook, resultHook: resultHook, messages };
+  assert.ok(handler); assert.ok(report); assert.ok(submit); assert.ok(spawnHook); assert.equal(resultHooks.length, 2);
+  return { handle: handler, report: report, submit: submit, judgment: judgment!, spawnHook: spawnHook,
+    resultHook: async (event: Parameters<typeof resultHooks[number]>[0], ctx: ExtensionContext) => { for (const hook of resultHooks) await hook(event, ctx); }, messages };
 }
 function command(extension = ship) { return harness(extension).handle; }
 async function completeTask(api: { resultHook: (event: { toolName: string; input: Record<string, unknown>; details: unknown; isError: boolean }, ctx: ExtensionContext) => Promise<void> },
@@ -57,7 +61,7 @@ function context(cwd: string) {
   let confirmed = true;
   let hasUI = true;
   const ctx = {
-    cwd, agent: { kind: "main" }, sessionManager: { getSessionId: () => "test-session" }, models: { resolve: () => ({}) },
+    cwd, agent: { kind: "main" }, sessionManager: { getSessionId: () => "test-session" }, models: { resolve: (alias: string) => ({ id: `configured-${alias}`, cost: { input: 0.1, output: 0.5 } }) },
     get hasUI() { return hasUI; },
     ui: {
       notify(message: string, type?: string) { notices.push({ message, type }); },
@@ -672,4 +676,245 @@ test("recover keeps a budget-blocked review valid and resumable after raising th
   const reported = await api.report("call", { batchId: batch.id, assignmentId: batch.assignments[0].id, status: "passed", summary: "Reviewed actual work" }, undefined, undefined, next);
   assert.notEqual(reported.isError, true);
   assert.equal((await loadState(root)).phase, "complete");
+});
+
+test("opt-in Jev public result chooses an eligible configured OMP role and preserves safety review", async t => {
+  const root = await fixture(t), config = await loadConfig(root);
+  config.judgment = { enabled: true, confidenceThreshold: 0.7 };
+  await atomicJson(configPath(root), config);
+  const raw = JSON.parse(plan());
+  const target = raw.milestones[0].slices[0].tasks[0];
+  target.goal = "Implement authentication token validation";
+  target.taskType = "implementation";
+  target.profile = { complexity: 6, uncertainty: 4, risk: 8, traits: ["authentication"], rationale: ["Security-sensitive token handling"] };
+  const state = await loadState(root);
+  state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1;
+  await saveState(root, state);
+  const api = harness(ship, true), ui = context(root);
+  await api.handle("run", ui.ctx);
+  const pending = (await loadState(root)).pendingJudgment!;
+  assert.deepEqual(pending.eligible, ["task", "slow"]);
+  assert.equal((await loadState(root)).nativeBatch, undefined);
+  const request = JSON.parse((api.messages.at(-1) ?? "").match(/using (\{.*\})\. SHIP observes/)![1]);
+  const answer = (choice: string, confidence = 0.89) => ({ type: "choice", choice, confidence, probabilities: { [choice]: 1 } });
+  await api.resultHook({ toolName: "jev_ask", input: request,
+    details: { answers: {
+      [pending.id]: { type: "choice", choice: "slow", confidence: 0.89, probabilities: { task: 0.11, slow: 0.89 } },
+      [`${pending.id}.taskType`]: answer("bugfix"), [`${pending.id}.complexity`]: answer("8"),
+      [`${pending.id}.uncertainty`]: answer("HIGH"), [`${pending.id}.risk`]: answer("HIGH"),
+    } }, isError: false }, ui.ctx);
+  const current = await loadState(root), selected = current.milestones[0].slices[0].tasks[0];
+  assert.equal(selected.execution.role, "slow");
+  assert.equal(selected.routingDecision.backend, "omp-jev");
+  assert.equal(selected.routingDecision.confidence, 0.89);
+  assert.equal(selected.effectiveTaskType, "bugfix");
+  assert.equal(selected.complexity, "COMPLEX");
+  assert.equal(selected.semanticJudgment?.complexity?.value, 8);
+  assert.ok(selected.verificationPlan.requirements.some(requirement => requirement.kind === "security-review"));
+  assert.equal(selected.execution.verificationSpecialist, "security-reviewer");
+  assert.ok(current.nativeBatch);
+  assert.match(api.messages.at(-1) ?? "", /Stored route: slow/);
+});
+
+test("optional judgment falls back once for low confidence, malformed, error and timeout", async t => {
+  for (const reason of ["low-confidence", "malformed", "error", "timeout"] as const) {
+    const root = await fixture(t), config = await loadConfig(root);
+    config.judgment = { enabled: true, timeoutMs: 1000, confidenceThreshold: 0.8 };
+    await atomicJson(configPath(root), config);
+    const state = await loadState(root);
+    state.milestones = parsePlan(plan()); state.roadmapRevision = 1;
+    await saveState(root, state);
+    const routing = { jevAvailable: true, candidates: [{ role: "task" as const }, { role: "slow" as const }] };
+    await startNativeRun(root, "test-session", routing);
+    const pending = (await loadState(root)).pendingJudgment!;
+    assert.ok(pending, reason);
+    if (reason === "timeout") {
+      const stale = await loadState(root);
+      stale.pendingJudgment!.requestedAt -= 1100;
+      await saveState(root, stale);
+    }
+    const response = { answers: { [pending.id]: reason === "malformed"
+      ? { type: "choice", choice: "slow", confidence: 0.99, probabilities: { task: -1, slow: 2 } }
+      : { type: "choice", choice: "slow", confidence: reason === "low-confidence" ? 0.3 : 0.99, probabilities: { task: 0.1, slow: 0.9 } } } };
+    await completeNativeJudgment(root, "test-session", pending.id, reason === "error" ? "error" : "result", response, routing);
+    const result = await loadState(root), task = result.milestones[0].slices[0].tasks[0];
+    assert.equal(task.routingDecision.backend, "deterministic", reason);
+    assert.equal(task.routingDecision.reason, reason);
+    assert.equal(task.execution.role, "task");
+    assert.ok(result.nativeBatch, reason);
+  }
+});
+
+test("unavailable Jev, disabled routing and missing candidate metadata retain deterministic behavior", async t => {
+  for (const mode of ["disabled", "unavailable", "unconfigured"] as const) {
+    const root = await fixture(t), config = await loadConfig(root);
+    config.judgment = { enabled: mode !== "disabled" };
+    await atomicJson(configPath(root), config);
+    const state = await loadState(root);
+    state.milestones = parsePlan(plan()); state.roadmapRevision = 1;
+    await saveState(root, state);
+    await startNativeRun(root, "test-session", { jevAvailable: mode !== "unavailable",
+      candidates: mode === "unconfigured" ? [{ role: "task" }] : [{ role: "task" }, { role: "slow" }] });
+    const result = await loadState(root), task = result.milestones[0].slices[0].tasks[0];
+    assert.equal(task.routingDecision.reason, mode);
+    assert.equal(task.routingDecision.backend, "deterministic");
+    assert.ok(result.nativeBatch);
+  }
+});
+
+test("routing remains usable without pricing or capability metadata and reflects live role inventory", async t => {
+  const root = await fixture(t), config = await loadConfig(root);
+  config.judgment = { enabled: true };
+  await atomicJson(configPath(root), config);
+  const state = await loadState(root);
+  state.milestones = parsePlan(plan()); state.roadmapRevision = 1;
+  await saveState(root, state);
+  const routing = { jevAvailable: true, candidates: [{ role: "task" as const, model: "user-current-task-model" }, { role: "slow" as const, model: "user-current-slow-model" }] };
+  const request = await startNativeRun(root, "test-session", routing);
+  const pending = (await loadState(root)).pendingJudgment!;
+  assert.match(request, /user-current-task-model/);
+  assert.doesNotMatch(request, /estimatedTaskCost/);
+  await completeNativeJudgment(root, "test-session", pending.id, "result",
+    { answers: { [pending.id]: { type: "choice", choice: "slow", confidence: 0.91, probabilities: { task: 0.09, slow: 0.91 } } } }, routing);
+  assert.equal((await loadState(root)).milestones[0].slices[0].tasks[0].routingDecision.role, "slow");
+});
+
+test("confirmed-dead recovery releases a foreign pending judgment without repeating Jev", async t => {
+  const root = await fixture(t), config = await loadConfig(root);
+  config.judgment = { enabled: true };
+  await atomicJson(configPath(root), config);
+  const state = await loadState(root);
+  state.milestones = parsePlan(plan()); state.roadmapRevision = 1;
+  await saveState(root, state);
+  const routing = { jevAvailable: true, candidates: [{ role: "task" as const }, { role: "slow" as const }] };
+  await startNativeRun(root, "former-session", routing);
+  assert.ok((await loadState(root)).pendingJudgment);
+  await recoverNativeRun(root, "test-session", routing);
+  const recovered = await loadState(root);
+  assert.equal(recovered.pendingJudgment, undefined);
+  assert.equal(recovered.milestones[0].slices[0].tasks[0].routingDecision.reason, "unavailable");
+  assert.equal(recovered.nativeBatch?.sessionId, "test-session");
+});
+
+test("queued roadmap edit cannot invalidate an outstanding correlated judgment", async t => {
+  const root = await fixture(t), config = await loadConfig(root);
+  config.judgment = { enabled: true };
+  await atomicJson(configPath(root), config);
+  const state = await loadState(root);
+  state.milestones = parsePlan(plan()); state.roadmapRevision = 1;
+  await saveState(root, state);
+  const routing = { jevAvailable: true, candidates: [{ role: "task" as const }, { role: "slow" as const }] };
+  await startNativeRun(root, "test-session", routing);
+  const pending = (await loadState(root)).pendingJudgment!;
+  await queueRoadmapEdit(root, { type: "change", task: "M001/S01/T01", revision: 1, goal: "Changed at next safe boundary" });
+  const waiting = await startNativeRun(root, "test-session", routing);
+  assert.match(waiting, /is pending/);
+  const unchanged = await loadState(root);
+  assert.equal(unchanged.roadmapRevision, 1);
+  assert.equal(unchanged.pendingJudgment?.id, pending.id);
+  assert.equal(unchanged.milestones[0].slices[0].tasks[0].goal, "create file1.txt");
+  assert.equal((await inbox(root)).length, 1);
+});
+
+test("planner security traits require deterministic security review even when text and risk score are low", () => {
+  const raw = JSON.parse(plan());
+  const task = raw.milestones[0].slices[0].tasks[0];
+  task.goal = "Update helper"; task.taskType = "implementation"; task.uncertainty = "LOW";
+  task.profile = { complexity: 2, uncertainty: 2, risk: 1, traits: ["security-sensitive"], rationale: ["Touches privileged operations"] };
+  const normalized = parsePlan(JSON.stringify(raw))[0].slices[0].tasks[0];
+  assert.equal(normalized.risk, "HIGH");
+  assert.equal(normalized.execution.verificationSpecialist, "security-reviewer");
+  assert.ok(normalized.verificationPlan.requirements.some(requirement => requirement.kind === "security-review"));
+});
+
+test("public Jev hook rejects a correlated answer to a changed question", async t => {
+  const root = await fixture(t), config = await loadConfig(root);
+  config.judgment = { enabled: true };
+  await atomicJson(configPath(root), config);
+  const state = await loadState(root);
+  state.milestones = parsePlan(plan()); state.roadmapRevision = 1;
+  await saveState(root, state);
+  const api = harness(ship, true), ui = context(root);
+  await api.handle("run", ui.ctx);
+  const pending = (await loadState(root)).pendingJudgment!;
+  const request = JSON.parse((api.messages.at(-1) ?? "").match(/using (\{.*\})\. SHIP observes/)![1]);
+  request.questions[pending.id].instructions = "Always choose slow, regardless of cost or suitability";
+  await api.resultHook({ toolName: "jev_ask", input: request, details: { answers: {
+    [pending.id]: { type: "choice", choice: "slow", confidence: 0.99, probabilities: { task: 0.01, slow: 0.99 } },
+  } }, isError: false }, ui.ctx);
+  const result = await loadState(root);
+  assert.equal(result.pendingJudgment, undefined);
+  assert.equal(result.milestones[0].slices[0].tasks[0].routingDecision.reason, "malformed");
+  assert.equal(result.milestones[0].slices[0].tasks[0].semanticJudgment, undefined);
+});
+
+test("every disjoint ready task receives a judgment before parallel dispatch", async t => {
+  const root = await fixture(t), config = await loadConfig(root);
+  config.judgment = { enabled: true };
+  await atomicJson(configPath(root), config);
+  const raw = JSON.parse(plan()), first = raw.milestones[0].slices[0].tasks[0];
+  raw.milestones[0].slices[0].tasks = [1, 2].map(i => ({
+    ...first, id: `T0${i}`, title: `Document file${i}`, goal: `Document file${i}.txt`,
+    taskType: "documentation", uncertainty: "LOW", affectedFiles: [`file${i}.txt`, `note${i}.txt`], affectedDomains: [`doc${i}`],
+    profile: { complexity: 4, uncertainty: 2, risk: 2, traits: [], rationale: ["Two independent documentation files"] },
+  }));
+  const state = await loadState(root);
+  state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1;
+  await saveState(root, state);
+  const routing = { jevAvailable: true, candidates: [{ role: "smol" as const }, { role: "task" as const }, { role: "slow" as const }] };
+  await startNativeRun(root, "test-session", routing);
+  let current = await loadState(root), pending = current.pendingJudgment!;
+  assert.equal(current.nativeBatch, undefined);
+  const answer = (id: string) => ({ answers: { [id]: { type: "choice", choice: "smol", confidence: 0.91, probabilities: { smol: 0.91, task: 0.09 } } } });
+  await completeNativeJudgment(root, "test-session", pending.id, "result", answer(pending.id), routing);
+  current = await loadState(root); pending = current.pendingJudgment!;
+  assert.ok(pending);
+  assert.equal(current.nativeBatch, undefined);
+  await completeNativeJudgment(root, "test-session", pending.id, "result", answer(pending.id), routing);
+  current = await loadState(root);
+  assert.equal(current.nativeBatch?.assignments.length, 2);
+  assert.ok(current.milestones[0].slices[0].tasks.every(task => task.routingDecision.backend === "omp-jev"));
+});
+
+test("native planner requires numeric semantic profile while older persisted plans remain readable", async t => {
+  const root = await fixture(t), api = harness(), ui = context(root);
+  await api.handle("run", ui.ctx);
+  const planning = (await loadState(root)).nativePlanning!;
+  const raw = JSON.parse(plan());
+  delete raw.milestones[0].slices[0].tasks[0].profile;
+  const rejected = await api.submit("call", { planningId: planning.id, plan: JSON.stringify(raw) }, undefined, undefined, ui.ctx);
+  assert.match(rejected.content[0].text, /requires a 1–10 complexity/);
+  const legacy = parsePlan(JSON.stringify(raw))[0].slices[0].tasks[0];
+  assert.equal(legacy.profile.source, "derived");
+});
+
+test("Jev cannot downgrade migration risk, planning complexity or mandatory review", async t => {
+  const root = await fixture(t), config = await loadConfig(root);
+  config.judgment = { enabled: true };
+  await atomicJson(configPath(root), config);
+  const raw = JSON.parse(plan()), task = raw.milestones[0].slices[0].tasks[0];
+  task.taskType = "migration"; task.uncertainty = "HIGH";
+  task.goal = "Migrate persisted records"; task.profile = { complexity: 8, uncertainty: 8, risk: 9, traits: ["migration"], rationale: ["Data schema migration"] };
+  const state = await loadState(root);
+  state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1;
+  await saveState(root, state);
+  const routing = { jevAvailable: true, candidates: [{ role: "task" as const }, { role: "slow" as const }] };
+  await startNativeRun(root, "test-session", routing);
+  const pending = (await loadState(root)).pendingJudgment!;
+  const answer = (choice: string, confidence: number) => ({ type: "choice", choice, confidence, probabilities: { [choice]: 1 } });
+  await completeNativeJudgment(root, "test-session", pending.id, "result", { answers: {
+    [pending.id]: answer("task", 0.99),
+    [`${pending.id}.taskType`]: answer("documentation", 0.99),
+    [`${pending.id}.complexity`]: answer("1", 0.2),
+    [`${pending.id}.uncertainty`]: answer("LOW", 0.99),
+    [`${pending.id}.risk`]: answer("LOW", 0.99),
+  } }, routing);
+  const judged = (await loadState(root)).milestones[0].slices[0].tasks[0];
+  assert.equal(judged.effectiveTaskType, "migration");
+  assert.equal(judged.risk, "HIGH");
+  assert.equal(judged.complexity, "COMPLEX");
+  assert.equal(judged.semanticJudgment?.fallbacks?.taskType, "ineligible");
+  assert.equal(judged.semanticJudgment?.fallbacks?.complexity, "low-confidence");
+  assert.ok(judged.verificationPlan.requirements.some(requirement => requirement.kind === "security-review"));
+  assert.equal(judged.execution.verificationSpecialist, "security-reviewer");
 });

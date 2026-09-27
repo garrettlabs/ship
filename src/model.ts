@@ -2,6 +2,7 @@ import type { Milestone, RepoCheck, RoadmapEdit, ShipState, Task, TaskType, Task
 import { classifyTask } from "./task-classification.ts";
 import { routeTask } from "./role-router.ts";
 import { DependencyGraph } from "./dependency-graph.ts";
+import { applyDecision, derivedProfile, fallback, safeSemanticType, validateProfile, validateSemanticJudgment } from "./judgment.ts";
 import { routeVerification } from "./verification.ts";
 
 function object(x: unknown): asserts x is Record<string, unknown> {
@@ -22,12 +23,14 @@ function optionalStrings(x: unknown, name: string): asserts x is string[] | unde
 function taskMetadata(task: Record<string, unknown>, fromPlan: boolean, repoChecks: readonly RepoCheck[] = []): Task {
   object(task); id(task.id, "T"); text(task.title, "task title"); text(task.goal, "goal");
   strings(task.acceptance, "acceptance", true); strings(task.verificationCommands, "verificationCommands", true);
-  if (fromPlan && ["status", "attempts", "lastError", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute", "execution", "verificationPlan", "dependencyLevel"].some(key => key in task)) throw new Error("Planner cannot override task lifecycle or classification");
+  if (fromPlan && ["status", "attempts", "lastError", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute", "execution", "routingDecision", "semanticJudgment", "effectiveTaskType", "effectiveUncertainty", "verificationPlan", "dependencyLevel"].some(key => key in task)) throw new Error("Planner cannot override task lifecycle or classification");
   if (task.objective !== undefined) text(task.objective, "objective");
   optionalStrings(task.dependencies, "dependencies"); optionalStrings(task.affectedDomains, "affectedDomains");
   optionalStrings(task.affectedFiles, "affectedFiles"); optionalStrings(task.verificationRequirements, "verificationRequirements");
   if (task.taskType !== undefined && !taskTypes.includes(task.taskType as TaskType)) throw new Error("Invalid taskType");
   if (task.uncertainty !== undefined && !uncertainties.includes(task.uncertainty as TaskUncertainty)) throw new Error("Invalid uncertainty");
+  if (task.profile !== undefined && !validateProfile(task.profile)) throw new Error("Invalid task profile");
+  if (fromPlan && task.profile && (task.profile as Task["profile"]).source === "derived") throw new Error("Planner cannot claim a derived profile");
   const normalized = {
     ...task,
     objective: task.objective ?? task.goal,
@@ -39,18 +42,53 @@ function taskMetadata(task: Record<string, unknown>, fromPlan: boolean, repoChec
     verificationRequirements: task.verificationRequirements ?? task.acceptance,
   } as unknown as Task;
   strings(normalized.verificationRequirements, "verificationRequirements", true);
-  const classification = classifyTask(normalized);
+  if (task.semanticJudgment !== undefined && !validateSemanticJudgment(task.semanticJudgment)) throw new Error("Invalid persisted semantic judgment");
+  const semantic = task.semanticJudgment as Task["semanticJudgment"];
+  const effectiveTaskType = semantic?.taskType ? safeSemanticType(normalized.taskType, semantic.taskType.value) : normalized.taskType;
+  const effectiveUncertainty = semantic?.uncertainty?.value === "HIGH" && normalized.uncertainty !== "UNKNOWN" ? "HIGH" : normalized.uncertainty;
+  const baseline = classifyTask({ ...normalized, taskType: effectiveTaskType, uncertainty: effectiveUncertainty });
+  const plannerProfile = task.profile && (task.profile as Task["profile"]).source !== "derived" ? task.profile as Task["profile"] : undefined;
+  const protectedTraits = plannerProfile?.traits.filter(trait => /^(?:security-sensitive|authentication|authorization|authn|authz|credentials?|secrets?|destructive|migration|persistence)$/i.test(trait)) ?? [];
+  const highComplexity = (plannerProfile?.complexity ?? 0) >= 7 || (semantic?.complexity?.value ?? 0) >= 7;
+  const highRisk = (plannerProfile?.risk ?? 0) >= 7 || semantic?.risk?.value === "HIGH" || protectedTraits.length > 0;
+  const classification = { ...baseline, complexity: highComplexity ? "COMPLEX" as const : baseline.complexity,
+    risk: highRisk ? "HIGH" as const : baseline.risk,
+    signals: [...baseline.signals, ...protectedTraits.map(trait => `profile trait: ${trait}`)],
+    rationale: [...baseline.rationale, ...(plannerProfile && plannerProfile.complexity >= 7 ? ["Planner assessed complexity at 7/10 or higher"] : []),
+      ...(semantic?.complexity?.value && semantic.complexity.value >= 7 ? ["Jev assessed complexity at 7/10 or higher"] : []),
+      ...(plannerProfile && plannerProfile.risk >= 7 ? ["Planner assessed risk at 7/10 or higher"] : []),
+      ...(semantic?.risk?.value === "HIGH" ? ["Jev assessed high risk"] : []),
+      ...(protectedTraits.length ? ["Security-sensitive planner traits require independent security review"] : [])] };
+  if (classification.complexity === "COMPLEX") classification.parallelEligible = false;
+  if (classification.risk === "HIGH") classification.parallelEligible = false;
+  if (classification.complexity === "COMPLEX" && classification.executionRoute === "direct") classification.executionRoute = "decompose";
+  const profile = task.profile ? { ...(task.profile as Task["profile"]), source: (task.profile as Task["profile"]).source ?? "planner" as const }
+    : derivedProfile({ ...normalized, complexity: classification.complexity, risk: classification.risk }, classification.rationale, classification.signals);
+  const routingDecision = task.routingDecision === undefined ? fallback({ ...normalized, complexity: classification.complexity, risk: classification.risk, effectiveTaskType, effectiveUncertainty }, "disabled")
+    : task.routingDecision as Task["routingDecision"];
+  if (!routingDecision || typeof routingDecision !== "object" || !["deterministic", "omp-jev"].includes(routingDecision.backend) ||
+      typeof routingDecision.fallbackUsed !== "boolean" || (routingDecision.backend === "omp-jev" && routingDecision.fallbackUsed) ||
+      (routingDecision.backend === "deterministic" && (!routingDecision.fallbackUsed || routingDecision.role !== routeTask({ ...normalized, taskType: effectiveTaskType, uncertainty: effectiveUncertainty, complexity: classification.complexity, risk: classification.risk }).role)) ||
+      (routingDecision.confidence !== undefined && (typeof routingDecision.confidence !== "number" || !Number.isFinite(routingDecision.confidence) || routingDecision.confidence < 0 || routingDecision.confidence > 1))) throw new Error("Invalid persisted routing decision");
+  const classified = { ...normalized, taskType: effectiveTaskType, uncertainty: effectiveUncertainty, complexity: classification.complexity, risk: classification.risk, profile, effectiveTaskType };
   const computed = {
     complexity: classification.complexity, risk: classification.risk,
+    effectiveTaskType, effectiveUncertainty,
     classificationSignals: classification.signals, classificationRationale: classification.rationale,
     parallelEligible: classification.parallelEligible, executionRoute: classification.executionRoute,
-    execution: routeTask({ ...normalized, complexity: classification.complexity, risk: classification.risk }),
-    verificationPlan: routeVerification({ ...normalized, complexity: classification.complexity, risk: classification.risk }, repoChecks),
+    execution: applyDecision(classified, routingDecision),
+    verificationPlan: routeVerification(classified, repoChecks),
   };
   for (const key of Object.keys(computed) as (keyof typeof computed)[]) {
     if (!fromPlan && task[key] !== undefined && JSON.stringify(task[key]) !== JSON.stringify(computed[key])) throw new Error(`Invalid persisted ${key}`);
   }
-  return { ...normalized, ...computed };
+  return { ...normalized, profile, routingDecision, ...computed };
+}
+
+export function recomputeJudgedTask(task: Task, repoChecks: readonly RepoCheck[] = []): void {
+  const { complexity, risk, classificationSignals, classificationRationale, parallelEligible, executionRoute, execution,
+    routingDecision, effectiveTaskType, effectiveUncertainty, verificationPlan, ...base } = task;
+  Object.assign(task, taskMetadata(base, false, repoChecks));
 }
 
 export function normalizePlan(value: unknown, fromPlan = false, repoChecks: readonly RepoCheck[] = []): Milestone[] {
@@ -109,8 +147,24 @@ export function validatePlan(value: unknown): asserts value is Milestone[] {
   unique(value);
   new DependencyGraph(value);
 }
-export function parsePlan(output: string, repoChecks: readonly RepoCheck[] = []): Milestone[] {
+export function parsePlan(output: string, repoChecks: readonly RepoCheck[] = [], requirePlannerProfile = false): Milestone[] {
   const raw: unknown = JSON.parse(output.trim()); object(raw);
+  if (requirePlannerProfile) {
+    if (!Array.isArray(raw.milestones)) throw new Error("Plan needs milestones");
+    for (const milestone of raw.milestones) {
+      object(milestone);
+      if (!Array.isArray(milestone.slices)) throw new Error("Milestone needs slices");
+      for (const slice of milestone.slices) {
+        object(slice);
+        if (!Array.isArray(slice.tasks)) throw new Error("Slice needs tasks");
+        for (const task of slice.tasks) {
+          object(task);
+          if (!validateProfile(task.profile) || task.profile.source === "derived") throw new Error("New planner task requires a 1–10 complexity, uncertainty and risk profile");
+          if (!taskTypes.includes(task.taskType as TaskType) || !uncertainties.includes(task.uncertainty as TaskUncertainty)) throw new Error("New planner task requires semantic taskType and uncertainty");
+        }
+      }
+    }
+  }
   return normalizePlan(raw.milestones, true, repoChecks);
 }
 export function tasks(state: ShipState) {
@@ -119,10 +173,10 @@ export function tasks(state: ShipState) {
 export function applyRoadmapEdit(state: ShipState, edit: RoadmapEdit): void {
   if (!state.milestones.length) throw new Error("Roadmap has not been loaded");
   if (!Number.isSafeInteger(edit.revision) || edit.revision < 0 || edit.revision !== state.roadmapRevision) throw new Error(`Stale roadmap revision: requested ${edit.revision}, current ${state.roadmapRevision}`);
-  if (state.activeAttempt || state.nativeBatch || state.nativePlanning) throw new Error("Cannot edit roadmap during an active attempt, native batch or planning assignment");
+  if (state.activeAttempt || state.nativeBatch || state.nativePlanning || state.pendingJudgment) throw new Error("Cannot edit roadmap during an active attempt, native batch, planning assignment or judgment");
   // A rejected graph or malformed hint must leave the authoritative plan untouched.
   const plan = structuredClone(state.milestones);
-  const hints = { taskType: edit.taskType, uncertainty: edit.uncertainty, dependencies: edit.dependencies, affectedFiles: edit.affectedFiles, affectedDomains: edit.affectedDomains, verificationRequirements: edit.verificationRequirements };
+  const hints = { taskType: edit.taskType, uncertainty: edit.uncertainty, profile: edit.profile, dependencies: edit.dependencies, affectedFiles: edit.affectedFiles, affectedDomains: edit.affectedDomains, verificationRequirements: edit.verificationRequirements };
   const supplied = Object.fromEntries(Object.entries(hints).filter(([, value]) => value !== undefined));
   if (edit.type === "add") {
     const match = /^([^/]+)\/([^/]+)$/.exec(edit.slice);
@@ -136,7 +190,7 @@ export function applyRoadmapEdit(state: ShipState, edit: RoadmapEdit): void {
     const entry = plan.flatMap(m => m.slices.flatMap(s => s.tasks.map(t => ({ key: `${m.id}/${s.id}/${t.id}`, t })))).find(x => x.key === edit.task);
     if (!entry) throw new Error(`Unknown task: ${edit.task}`);
     if (entry.t.status !== "pending" || entry.t.attempts !== 0) throw new Error(`Task ${edit.task} has already started`);
-    const { complexity, risk, classificationSignals, classificationRationale, parallelEligible, executionRoute, execution, verificationPlan, dependencyLevel, ...base } = entry.t;
+    const { complexity, risk, classificationSignals, classificationRationale, parallelEligible, executionRoute, execution, routingDecision, semanticJudgment, effectiveTaskType, effectiveUncertainty, verificationPlan, dependencyLevel, profile, ...base } = entry.t;
     const updated = taskMetadata({ ...base, goal: edit.goal, objective: edit.goal, ...supplied, verificationRequirements: [...new Set([...base.verificationRequirements, ...(edit.verificationRequirements ?? [])])] }, false, state.repoChecks);
     Object.assign(entry.t, updated);
   }
