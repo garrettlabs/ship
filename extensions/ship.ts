@@ -73,14 +73,15 @@ export function createShipExtension() {
       if (ctx.agent.kind !== "main" || event.isError || (event.toolName !== "task" && event.toolName !== "wait")) return;
       const sessionId = ctx.sessionManager.getSessionId();
       if (event.toolName === "wait") {
-        const details = event.details as { jobs?: { id?: string; type?: string; status?: string }[] } | undefined;
+        const details = event.details as { jobs?: { id?: string; type?: string; status?: string; resultText?: string; structured?: { status?: string; data?: unknown } }[] } | undefined;
         for (const job of details?.jobs ?? []) {
           const pending = job.id ? pendingJobs.get(job.id) : undefined;
           if (!pending || pending.sessionId !== sessionId) continue;
           if (job.status === "running") continue;
           pendingJobs.delete(job.id!);
           if (job.type === "task" && job.status === "completed") {
-            await confirmNativeSpecialist(pending.root, sessionId, pending.assignmentId, pending.agent);
+            await confirmNativeSpecialist(pending.root, sessionId, pending.assignmentId, pending.agent,
+              job.structured ? job.structured.status === "valid" ? job.structured.data : undefined : job.resultText);
           }
         }
         return;
@@ -90,7 +91,7 @@ export function createShipExtension() {
       const batch = (await loadState(root)).nativeBatch;
       if (!batch || batch.sessionId !== sessionId || batch.awaitingBudget) return;
       const items = taskItems(event.input);
-      const details = event.details as { results?: { index?: number; id?: string; agent?: string; exitCode?: number; error?: string; aborted?: boolean }[];
+      const details = event.details as { results?: { index?: number; id?: string; agent?: string; exitCode?: number; error?: string; aborted?: boolean; output?: string; structuredOutput?: { status?: string; data?: unknown }; extractedToolData?: Record<string, unknown[]> }[];
         progress?: { index?: number; id?: string; agent?: string; status?: string }[]; async?: { state?: string } } | undefined;
       const matched = (index: number | undefined, id: string | undefined, agent: string | undefined) => {
         const item = items[index ?? -1], name = item?.name;
@@ -103,7 +104,9 @@ export function createShipExtension() {
       for (const result of details?.results ?? []) {
         const assignmentId = matched(result.index, result.id, result.agent);
         if (assignmentId && result.exitCode === 0 && !result.error && !result.aborted) {
-          await confirmNativeSpecialist(root, sessionId, assignmentId, result.agent!);
+          await confirmNativeSpecialist(root, sessionId, assignmentId, result.agent!,
+            result.structuredOutput ? result.structuredOutput.status === "valid" ? result.structuredOutput.data : undefined
+              : result.extractedToolData?.submit_review?.at(-1) ?? result.output);
         }
       }
       if (details?.async?.state === "running") for (const progress of details.progress ?? []) {
@@ -125,7 +128,7 @@ export function createShipExtension() {
     api.registerTool({
       name: "ship_plan",
       label: "Ship execution plan",
-      description: "Submit the assigned OMP planner's complete raw JSON answer (not Markdown or fenced text) as plan, with the active planningId. Expected top-level JSON: {\"milestones\":[{\"id\":\"M001\",\"title\":\"...\",\"outcome\":\"...\",\"slices\":[{\"id\":\"S01\",\"title\":\"...\",\"tasks\":[{\"id\":\"T01\",\"title\":\"...\",\"objective\":\"...\",\"goal\":\"...\",\"dependencies\":[],\"acceptance\":[\"...\"],\"affectedDomains\":[],\"affectedFiles\":[],\"taskType\":\"implementation\",\"uncertainty\":\"UNKNOWN\",\"verificationRequirements\":[\"...\"],\"verificationCommands\":[\"...\"]}]}]}]}. Include complete milestones, slices and tasks; no prose, code fences, or status fields.",
+      description: "Submit the assigned OMP planner's complete raw JSON answer (not Markdown or fenced text) as plan, with the active planningId. Required top-level JSON: {\"milestones\":[{\"id\":\"M001\",\"title\":\"...\",\"outcome\":\"...\",\"slices\":[{\"id\":\"S01\",\"title\":\"...\",\"tasks\":[{\"id\":\"T01\",\"title\":\"...\",\"objective\":\"...\",\"goal\":\"...\",\"dependencies\":[],\"acceptance\":[\"...\"],\"affectedDomains\":[],\"affectedFiles\":[],\"taskType\":\"implementation\",\"uncertainty\":\"UNKNOWN\",\"profile\":{\"complexity\":5,\"uncertainty\":5,\"risk\":5,\"traits\":[],\"rationale\":[\"Bounded scope\"]},\"verificationRequirements\":[\"...\"],\"verificationCommands\":[\"...\"]}]}]}]}. Every new task MUST include an explicit taskType, uncertainty and numeric 1–10 profile (complexity/uncertainty/risk, traits, rationale). Do not submit prose, fences, derived route/status/attempt fields, or plans missing slices.",
       parameters: z.object({ planningId: z.string(), plan: z.string() }),
       async execute(_id, params, _signal, _update, ctx) {
         try {

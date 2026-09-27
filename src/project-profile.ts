@@ -56,7 +56,7 @@ async function source(root: string, relative: string): Promise<{ fingerprint: st
   }
 }
 
-type Snapshot = { fingerprints: Record<string, string>; contents: Record<string, string>; layout: string[] };
+type Snapshot = { fingerprints: Record<string, string>; contents: Record<string, string>; layout: string[]; overflow: string[] };
 async function inspect(root: string): Promise<Snapshot> {
   const fingerprints: Record<string, string> = {};
   const contents: Record<string, string> = {};
@@ -66,26 +66,30 @@ async function inspect(root: string): Promise<Snapshot> {
   const layout = rootNames.filter(name => directories.includes(name));
   const rootCandidates = [...SOURCE_NAMES, ...rootNames.filter(name => /\.(?:sln|slnx|csproj)$/.test(name)).slice(0, 16)];
   const paths = [...rootCandidates];
+  const overflow: string[] = [];
+  const workspaceNames: Record<string, string[]> = {};
   for (const directory of ["apps", "packages", "services"]) {
-    const children = (await names(root, directory, true)).slice(0, 24);
-    if (children.length) {
-      layout.push(...children.map(child => `${directory}/${child}`));
-      for (const child of children) paths.push(...SCOPED_NAMES.map(name => `${directory}/${child}/${name}`));
-    }
+    const all = await names(root, directory, true);
+    workspaceNames[directory] = all;
+    if (all.length > 24) overflow.push(`${directory}: ${all.length - 24} workspace directories not inspected; scoped instructions and project checks unknown`);
+    const children = all.slice(0, 24);
+    layout.push(...children.map(child => `${directory}/${child}`));
+    for (const child of children) paths.push(...SCOPED_NAMES.map(name => `${directory}/${child}/${name}`));
   }
   for (const directory of ["src", "lib", "app", "test", "tests", "migrations", "db", "database"]) {
     const children = (await names(root, directory)).slice(0, 32);
     layout.push(...children.map(child => `${directory}/${child}`));
   }
-  const workflows = (await names(root, ".github/workflows")).filter(name => /\.ya?ml$/.test(name)).slice(0, 24);
-  paths.push(...workflows.map(name => `.github/workflows/${name}`));
-  fingerprints["@layout"] = createHash("sha256").update(JSON.stringify(layout)).digest("hex");
+  const workflows = (await names(root, ".github/workflows")).filter(name => /\.ya?ml$/.test(name));
+  if (workflows.length > 24) overflow.push(`${workflows.length - 24} CI workflows not inspected; additional checks unknown`);
+  paths.push(...workflows.slice(0, 24).map(name => `.github/workflows/${name}`));
+  fingerprints["@layout"] = createHash("sha256").update(JSON.stringify({ layout, workspaceNames })).digest("hex");
   fingerprints["@workflows"] = createHash("sha256").update(JSON.stringify(workflows)).digest("hex");
   for (const relative of unique(paths)) {
     const entry = await source(root, relative);
     if (entry) { fingerprints[relative] = entry.fingerprint; contents[relative] = entry.text; }
   }
-  return { fingerprints, contents, layout };
+  return { fingerprints, contents, layout, overflow };
 }
 
 function discover(snapshot: Snapshot): ProjectProfile["facts"] {
@@ -182,7 +186,7 @@ export async function readProjectProfile(root: string): Promise<ProjectProfile> 
 
 async function persist(root: string, snapshot: Snapshot): Promise<ProjectProfile> {
   const facts = discover(snapshot);
-  const unknowns = ["Architectural boundaries require task-specific reconnaissance"];
+  const unknowns = ["Architectural boundaries require task-specific reconnaissance", ...snapshot.overflow];
   if (!facts.commands.test) unknowns.push("Test command not discovered");
   if (!facts.commands.typecheck) unknowns.push("Typecheck command not discovered");
   if (!facts.commands.lint) unknowns.push("Lint command not discovered");

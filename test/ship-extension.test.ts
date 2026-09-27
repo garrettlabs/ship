@@ -7,7 +7,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import ship, { createShipExtension } from "../extensions/ship.ts";
 import { fixture, plan } from "./helpers.ts";
-import { completeNativeJudgment, recoverNativeRun, startNativeRun } from "../src/native-execution.ts";
+import { completeNativeJudgment, recoverNativeRun, reviewVerdict, startNativeRun } from "../src/native-execution.ts";
 import { parsePlan } from "../src/model.ts";
 import { atomicJson, configPath, exists, loadConfig, loadState, queueRoadmapEdit, saveState, statePath } from "../src/store.ts";
 import { git } from "../src/git.ts";
@@ -43,14 +43,15 @@ function harness(extension = ship, jev = false) {
 }
 function command(extension = ship) { return harness(extension).handle; }
 async function completeTask(api: { resultHook: (event: { toolName: string; input: Record<string, unknown>; details: unknown; isError: boolean }, ctx: ExtensionContext) => Promise<void> },
-  assignmentId: string, agent: string, ctx: ExtensionContext, options: { status?: "success" | "failed" | "skipped" | "async"; name?: string; resultAgent?: string } = {}) {
+  assignmentId: string, agent: string, ctx: ExtensionContext, options: { status?: "success" | "failed" | "skipped" | "async"; name?: string; resultAgent?: string; review?: unknown } = {}) {
   const name = options.name ?? `Ship${assignmentId.replaceAll("-", "").slice(0, 26)}`;
   const status = options.status ?? "success";
   const resultAgent = options.resultAgent ?? agent;
+  const review = options.review ?? { overall_correctness: "correct", explanation: "No defects found", confidence: 0.95 };
   await api.resultHook({ toolName: "task", input: { name, agent, task: `Inspect assignment ${assignmentId} acceptance and report findings` }, isError: false,
     details: status === "skipped" ? { results: [], totalDurationMs: 0 } :
       status === "async" ? { results: [], async: { state: "running" }, progress: [{ id: name, index: 0, agent, status: "running" }] } :
-        { results: [{ id: name, index: 0, agent: resultAgent, exitCode: status === "failed" ? 1 : 0 }], totalDurationMs: 1 },
+        { results: [{ id: name, index: 0, agent: resultAgent, exitCode: status === "failed" ? 1 : 0, structuredOutput: { status: "valid", data: review } }], totalDurationMs: 1 },
   }, ctx);
 }
 
@@ -640,7 +641,7 @@ test("later spawn block, skipped or failed task results cannot pass review; only
   await api.resultHook({ toolName: "wait", input: {}, details: { jobs: [{ id: key.slice(2), type: "task", status: "failed" }] }, isError: false }, ui.ctx);
   assert.equal((await claim()).isError, true);
   await completeTask(api, assignment.id, "reviewer", ui.ctx, { status: "async" });
-  await api.resultHook({ toolName: "wait", input: {}, details: { jobs: [{ id: key.slice(2), type: "task", status: "completed" }] }, isError: false }, ui.ctx);
+  await api.resultHook({ toolName: "wait", input: {}, details: { jobs: [{ id: key.slice(2), type: "task", status: "completed", structured: { status: "valid", data: { overall_correctness: "correct", explanation: "No defects", confidence: 0.9 } } }] }, isError: false }, ui.ctx);
   await writeFile(path.join(root, "file1.txt"), "hello\n");
   assert.notEqual((await claim()).isError, true);
   assert.equal((await loadState(root)).phase, "complete");
@@ -1102,4 +1103,145 @@ test("first-use adoption carries project evidence and protected checks into opt-
   assert.equal(current.nativeBatch?.stage, "executing");
   assert.equal(current.preexistingWork?.paths.includes("user-notes.txt"), true);
   assert.equal(await readFile(path.join(root, "user-notes.txt"), "utf8"), "Do not overwrite my notes.\n");
+});
+
+test("an adverse, missing or malformed correlated reviewer verdict cannot pass", async t => {
+  for (const review of [{ overall_correctness: "incorrect", findings: [{ title: "Critical defect", priority: 1 }] }, "No review verdict", { overall_correctness: "correct", findings: [{ title: "Contradiction", priority: 2 }] }]) {
+    const root = await fixture(t), state = await loadState(root);
+    const raw = JSON.parse(plan()); raw.milestones[0].slices[0].tasks[0].profile.complexity = 8;
+    state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1; await saveState(root, state);
+    const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+    const execution = (await loadState(root)).nativeBatch!;
+    await writeFile(path.join(root, "file1.txt"), "hello\n");
+    await api.report("call", { batchId: execution.id, assignmentId: execution.assignments[0].id, status: "passed", summary: "Implemented" }, undefined, undefined, ui.ctx);
+    const reviewBatch = (await loadState(root)).nativeBatch!;
+    assert.equal(reviewBatch.stage, "reviewing");
+    await completeTask(api, reviewBatch.assignments[0].id, "reviewer", ui.ctx, { review });
+    await completeTask(api, reviewBatch.assignments[0].id, "reviewer", ui.ctx);
+    const claim = await api.report("call", { batchId: reviewBatch.id, assignmentId: reviewBatch.assignments[0].id, status: "passed", summary: "Approved" }, undefined, undefined, ui.ctx);
+    assert.equal(claim.isError, true);
+    assert.equal((await loadState(root)).milestones[0].slices[0].tasks[0].status, "verifying");
+  }
+});
+
+test("review output parsing accepts explicit JSON/text verdicts and rejects ambiguity", () => {
+  assert.equal(reviewVerdict({ structuredOutput: { status: "valid", data: { summary: { overall_correctness: "correct" }, findings: [] } } }), "correct");
+  assert.equal(reviewVerdict({ resultText: '{"overall_correctness":"incorrect","findings":[{"title":"Defect","priority":1}]}' }), "incorrect");
+  assert.equal(reviewVerdict("Patch is incorrect (90% confidence)"), "incorrect");
+  assert.equal(reviewVerdict("Patch is correct. Patch is incorrect."), "unknown");
+  assert.equal(reviewVerdict({ overall_correctness: "correct", findings: [{ title: "Defect", priority: 2 }] }), "unknown");
+  assert.equal(reviewVerdict({ overall_correctness: "correct", findings: [{ title: "Suggestion", priority: 3 }] }), "correct");
+  assert.equal(reviewVerdict({ coverage_summary: "Reviewed credential handling", findings: [], reviewed_paths: ["src/auth.ts"] }), "correct");
+  assert.equal(reviewVerdict({ coverage_summary: "Reviewed credential handling", findings: [{ severity: "low" }] }), "incorrect");
+  assert.equal(reviewVerdict({ coverage_summary: "Some paths unchecked", findings: [], deferred: [{ reason: "Missing module" }] }), "unknown");
+  assert.equal(reviewVerdict({ coverage_summary: "Reviewed credential handling" }), "correct");
+  assert.equal(reviewVerdict({ coverage_summary: " ", findings: [] }), "unknown");
+  assert.equal(reviewVerdict({ coverage_summary: "Reviewed credential handling", findings: [{ severity: "surprise" }] }), "unknown");
+});
+
+test("bundled security-reviewer coverage accepts clean results but blocks vulnerabilities and deferred work", async t => {
+  const cases = [
+    { result: { coverage_summary: "Reviewed token handling", findings: [], reviewed_paths: ["file1.txt"] }, accepted: true },
+    { result: { coverage_summary: "Reviewed token handling", findings: [{ severity: "informational", title: "Nit" }] }, accepted: true },
+    { result: { coverage_summary: "Found token exposure", findings: [{ severity: "low", title: "Leak" }] }, accepted: false },
+    { result: { coverage_summary: "Incomplete", findings: [], deferred: [{ reason: "Unavailable policy" }] }, accepted: false },
+  ];
+  for (const { result, accepted } of cases) {
+    const root = await fixture(t), state = await loadState(root);
+    const raw = JSON.parse(plan());
+    raw.milestones[0].slices[0].tasks[0].profile.risk = 9;
+    state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1; await saveState(root, state);
+    const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+    const execution = (await loadState(root)).nativeBatch!;
+    const id = execution.assignments[0].id;
+    await api.spawnHook({ spawnKey: `0-Ship${id.replaceAll("-", "").slice(0, 26)}`, agent: "task", invocationKind: "task" }, ui.ctx);
+    await writeFile(path.join(root, "file1.txt"), "hello\n");
+    await api.report("call", { batchId: execution.id, assignmentId: id, status: "passed", summary: "Implemented" }, undefined, undefined, ui.ctx);
+    const review = (await loadState(root)).nativeBatch!;
+    assert.equal(review.stage, "reviewing");
+    assert.match(api.messages.at(-1) ?? "", /agent: "security-reviewer"/);
+    await completeTask(api, review.assignments[0].id, "security-reviewer", ui.ctx, { review: result });
+    const claim = await api.report("call", { batchId: review.id, assignmentId: review.assignments[0].id, status: "passed", summary: "Security inspection finished" }, undefined, undefined, ui.ctx);
+    assert.equal(claim.isError === true, !accepted);
+    assert.equal((await loadState(root)).phase === "complete", accepted);
+  }
+});
+
+test("reviewer P3 finding does not override an explicit correct verdict", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  const raw = JSON.parse(plan()); raw.milestones[0].slices[0].tasks[0].profile.complexity = 8;
+  state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+  const execution = (await loadState(root)).nativeBatch!;
+  await api.spawnHook({ spawnKey: `0-Ship${execution.assignments[0].id.replaceAll("-", "").slice(0, 26)}`, agent: "task", invocationKind: "task" }, ui.ctx);
+  await writeFile(path.join(root, "file1.txt"), "hello\n");
+  await api.report("call", { batchId: execution.id, assignmentId: execution.assignments[0].id, status: "passed", summary: "Implemented" }, undefined, undefined, ui.ctx);
+  const review = (await loadState(root)).nativeBatch!;
+  await completeTask(api, review.assignments[0].id, "reviewer", ui.ctx, { review: {
+    overall_correctness: "correct", explanation: "Only a P3 nit", confidence: 0.9,
+    findings: [{ title: "Improve phrasing", priority: 3, body: "Minor formatting suggestion" }],
+  } });
+  const claim = await api.report("call", { batchId: review.id, assignmentId: review.assignments[0].id, status: "passed", summary: "Accepted with non-blocking suggestion" }, undefined, undefined, ui.ctx);
+  assert.notEqual(claim.isError, true);
+  assert.equal((await loadState(root)).phase, "complete");
+});
+
+test("newly declared integration check runs despite a frozen single-domain task plan", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  await writeFile(path.join(root, "package.json"), JSON.stringify({ scripts: { test: "node -e \"process.exit(0)\"" } }));
+  await git(root, ["add", "package.json"]); await git(root, ["commit", "-m", "Declare initial checks"]);
+  state.milestones = parsePlan(plan()); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+  const batch = (await loadState(root)).nativeBatch!;
+  await writeFile(path.join(root, "package.json"), JSON.stringify({ scripts: {
+    test: "node -e \"process.exit(0)\"", "test:integration": "node -e \"process.exit(1)\"",
+  } }));
+  await writeFile(path.join(root, "file1.txt"), "hello\n");
+  await api.report("call", { batchId: batch.id, assignmentId: batch.assignments[0].id, status: "passed", summary: "Created file" }, undefined, undefined, ui.ctx);
+  const current = await loadState(root);
+  assert.equal(current.phase, "blocked");
+  assert.match(current.blockedReason ?? "", /Integration check failed/);
+  assert.ok(current.repoChecks?.some(check => check.command === "npm run test:integration"));
+  assert.deepEqual(current.milestones[0].slices[0].tasks[0].acceptance, ["file1.txt contains hello"]);
+});
+
+test("a newly declared typecheck is required before a pending task can pass", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  state.milestones = parsePlan(plan()); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+  const batch = (await loadState(root)).nativeBatch!;
+  await writeFile(path.join(root, "package.json"), JSON.stringify({ scripts: { typecheck: "node -e \"process.exit(1)\"" } }));
+  await writeFile(path.join(root, "file1.txt"), "hello\n");
+  await api.report("call", { batchId: batch.id, assignmentId: batch.assignments[0].id, status: "passed", summary: "Created file" }, undefined, undefined, ui.ctx);
+  const current = await loadState(root), task = current.milestones[0].slices[0].tasks[0];
+  assert.equal(task.status, "running");
+  assert.equal(task.attempts, 2);
+  assert.match(task.lastError ?? "", /npm run typecheck/);
+  assert.ok(task.verificationPlan.requirements.some(requirement => requirement.command === "npm run typecheck"));
+  assert.deepEqual(task.acceptance, ["file1.txt contains hello"]);
+  assert.deepEqual(task.verificationCommands, ["grep -q '^hello$' file1.txt"]);
+});
+
+test("a later task cannot overwrite edits to a previously owned file after a pause", async t => {
+  const root = await fixture(t), state = await loadState(root);
+  const raw = JSON.parse(plan());
+  raw.milestones[0].slices[0].tasks[0].affectedFiles = ["file1.txt"];
+  raw.milestones[0].slices[0].tasks.push({
+    id: "T02", title: "Reuse file", goal: "extend file1.txt", dependencies: ["T01"], affectedFiles: ["file1.txt"],
+    acceptance: ["file1.txt remains correct"], verificationCommands: ["grep -q '^hello$' file1.txt"],
+  });
+  state.milestones = parsePlan(JSON.stringify(raw)); state.roadmapRevision = 1; await saveState(root, state);
+  const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
+  const first = (await loadState(root)).nativeBatch!;
+  await writeFile(path.join(root, "file1.txt"), "hello\n");
+  await api.handle("pause", ui.ctx);
+  await api.report("call", { batchId: first.id, assignmentId: first.assignments[0].id, status: "passed", summary: "Created file" }, undefined, undefined, ui.ctx);
+  assert.equal((await loadState(root)).paused, true);
+  await writeFile(path.join(root, "file1.txt"), "user edit\n");
+  await api.handle("resume", ui.ctx); await api.handle("run", ui.ctx);
+  const blocked = await loadState(root);
+  assert.equal(blocked.phase, "blocked");
+  assert.match(blocked.blockedReason ?? "", /Previously owned file changed.*file1\.txt/);
+  assert.equal(blocked.milestones[0].slices[0].tasks[1].attempts, 0);
+  assert.equal(await readFile(path.join(root, "file1.txt"), "utf8"), "user edit\n");
 });

@@ -51,6 +51,8 @@ function validateNativeState(s: ShipState): void {
           (a.status === "pending" ? a.summary !== undefined : !label(a.summary)) ||
           (a.routed !== undefined && typeof a.routed !== "boolean") ||
           (a.specialistDispatched !== undefined && typeof a.specialistDispatched !== "boolean") ||
+          (a.reviewVerdict !== undefined && !["correct", "incorrect", "unknown"].includes(a.reviewVerdict)) ||
+          (a.verifiedCommands !== undefined && (!Array.isArray(a.verifiedCommands) || a.verifiedCommands.some(command => !label(command)))) ||
           !known.has(a.key) || !["running", "verifying"].includes(known.get(a.key)!.status) ||
           (b.stage === "reviewing" && known.get(a.key)!.status !== "verifying")) invalid("batch assignment");
       ids.add(a.id); keys.add(a.key);
@@ -71,6 +73,9 @@ export async function loadState(root: string): Promise<ShipState> {
   const s = await readJson<ShipState>(statePath(root));
   if (!s || s.schemaVersion !== 1 || !Array.isArray(s.milestones) || typeof s.paused !== "boolean" || !Number.isInteger(s.roadmapRevision)) throw new Error("Invalid state.json");
   if (s.repoChecks !== undefined && (!Array.isArray(s.repoChecks) || s.repoChecks.some(c => !c || !["focused-tests", "broader-tests", "typecheck", "lint", "build", "integration"].includes(c.kind) || typeof c.command !== "string" || !c.command.trim() || typeof c.source !== "string" || !c.source.trim()))) throw new Error("Invalid persisted repo checks");
+  if (s.ownedSnapshots !== undefined && (typeof s.ownedSnapshots !== "object" || s.ownedSnapshots === null ||
+      Array.isArray(s.ownedSnapshots) || Object.entries(s.ownedSnapshots).some(([filename, hash]) =>
+        !filename || typeof hash !== "string" || (!["absent", "directory", "unknown"].includes(hash) && !/^[a-f0-9]{64}$/.test(hash))))) throw new Error("Invalid persisted owned snapshots");
   if (s.milestones.length) s.milestones = normalizePlan(s.milestones, false, s.repoChecks);
   validateNativeState(s);
   s.knowledge ??= []; s.processedInbox ??= []; s.dispatches ??= 0; s.planningFailures ??= 0;

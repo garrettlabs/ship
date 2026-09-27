@@ -125,3 +125,17 @@ test("non-Git directories explicitly report unknown Git state", async t => {
   const root = await fixture(t);
   assert.deepEqual(await gitDirtySnapshot(root), { branch: null, paths: [], dirty: false, unknown: true });
 });
+
+test("workspace overflow invalidates cache and declares uninspected scoped instructions unknown", async t => {
+  const root = await fixture(t);
+  for (let index = 0; index < 24; index++) await mkdir(path.join(root, "apps", `app-${String(index).padStart(2, "0")}`), { recursive: true });
+  const initial = await readProjectProfile(root);
+  await mkdir(path.join(root, "apps", "z-last"), { recursive: true });
+  await writeFile(path.join(root, "apps", "z-last", "AGENTS.md"), "Specific instructions");
+  const changed = await readProjectProfile(root);
+  assert.notEqual(changed.sourceFingerprints["@layout"], initial.sourceFingerprints["@layout"]);
+  assert.ok(changed.unknowns.some(value => /workspace directories not inspected.*instructions.*unknown/.test(value)));
+  assert.equal(changed.facts.instructions.includes("apps/z-last/AGENTS.md"), false);
+  await mkdir(path.join(root, "apps", "zz-last"), { recursive: true });
+  assert.notEqual((await readProjectProfile(root)).sourceFingerprints["@layout"], changed.sourceFingerprints["@layout"]);
+});
