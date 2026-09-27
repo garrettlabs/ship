@@ -29,15 +29,14 @@ export async function loadState(root: string): Promise<ShipState> {
   if (s.schemaVersion !== 1 || !Array.isArray(s.milestones) || typeof s.paused !== "boolean" || !Number.isInteger(s.roadmapRevision)) throw new Error("Invalid state.json");
   if (s.repoChecks !== undefined && (!Array.isArray(s.repoChecks) || s.repoChecks.some(c => !c || !["focused-tests", "broader-tests", "typecheck", "lint", "build", "integration"].includes(c.kind) || typeof c.command !== "string" || !c.command.trim() || typeof c.source !== "string" || !c.source.trim()))) throw new Error("Invalid persisted repo checks");
   if (s.milestones.length) s.milestones = normalizePlan(s.milestones, false, s.repoChecks);
-  s.knowledge ??= []; s.processedInbox ??= []; s.reviewedSlices ??= []; s.reviewAttempts ??= {}; s.dispatches ??= 0; s.planningFailures ??= 0;
+  s.knowledge ??= []; s.processedInbox ??= []; s.dispatches ??= 0; s.planningFailures ??= 0;
   return s;
 }
 export async function saveState(root: string, state: ShipState): Promise<void> { state.updatedAt = new Date().toISOString(); await atomicJson(statePath(root), state); }
 export async function loadConfig(root: string): Promise<ShipConfig> {
   const c = await readJson<ShipConfig>(configPath(root));
-  if (c.schemaVersion !== 1 || !c.worker?.command || !c.limits) throw new Error("Invalid config.json");
-  strings(c.worker.args, "worker.args");
-  for (const n of [c.worker.startupTimeoutMs, c.worker.inactivityTimeoutMs, c.worker.hardTimeoutMs, c.limits.maxTaskAttempts, c.limits.maxDispatches, c.verificationTimeoutMs ?? 300_000]) {
+  if (c.schemaVersion !== 1 || !c.limits) throw new Error("Invalid config.json");
+  for (const n of [c.limits.maxTaskAttempts, c.limits.maxDispatches, c.verificationTimeoutMs ?? 300_000]) {
     if (!Number.isSafeInteger(n) || n <= 0) throw new Error("Timeouts and limits must be positive integers");
   }
   strings(c.protectedChecks ?? [], "protectedChecks");

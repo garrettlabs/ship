@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { parsePlan, applyRoadmapEdit, applyReview } from "../src/model.ts";
+import { parsePlan, applyRoadmapEdit } from "../src/model.ts";
 import { atomicJson, loadState, saveState, statePath } from "../src/store.ts";
 import { fixture, plan } from "./helpers.ts";
 import { routeTask } from "../src/role-router.ts";
@@ -171,9 +171,10 @@ test("goal edits refresh the objective and classification without weakening acce
   assert.deepEqual(updated.verificationCommands, initial.verificationCommands);
   assert.equal(updated.risk, "HIGH");
   assert.equal(updated.execution.verificationSpecialist, "security-reviewer");
-  applyReview(state, JSON.stringify({ revision: 2, rationale: "implementation revision", lessons: [], changes: [{ task: "M001/S01/T01", goal: "implement using local file", reason: "evidence" }] }), "test");
-  assert.equal(updated.objective, "implement using local file"); assert.equal(updated.risk, "UNKNOWN");
-  assert.equal(updated.execution.verificationSpecialist, undefined);
+  applyRoadmapEdit(state, { type: "change", task: "M001/S01/T01", goal: "implement using local file", revision: 2 });
+  assert.equal(state.milestones[0].slices[0].tasks[0].objective, "implement using local file");
+  assert.equal(state.milestones[0].slices[0].tasks[0].risk, "UNKNOWN");
+  assert.equal(state.milestones[0].slices[0].tasks[0].execution.verificationSpecialist, undefined);
   applyRoadmapEdit(state, { type: "add", slice: "M001/S01", title: "Second result", goal: "produce second result", acceptance: "second result works", check: "test -f second", revision: 3 });
   assert.equal(state.milestones[0].slices[0].tasks[1].objective, "produce second result");
 });

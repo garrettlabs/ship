@@ -1,14 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import ship, { createShipExtension } from "../extensions/ship.ts";
 import { fixture, plan } from "./helpers.ts";
 import { parsePlan } from "../src/model.ts";
-import { atomicJson, configPath, loadConfig, loadState, saveState } from "../src/store.ts";
-import { Controller } from "../src/controller.ts";
+import { atomicJson, configPath, exists, loadConfig, loadState, saveState } from "../src/store.ts";
 
 function harness(extension = ship) {
   let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
@@ -61,6 +61,51 @@ async function inbox(root: string): Promise<{ type: string; [key: string]: unkno
   return Promise.all(files.filter(file => file.endsWith(".json")).map(async file => JSON.parse(await readFile(path.join(dir, file), "utf8"))));
 }
 
+test("/ship init starts native planning and refuses to replace existing project state", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "ship-native-init-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(root, "brief.md"), "Implement a local project.");
+  const ui = context(root), handle = command();
+  ui.prompts.push("brief.md");
+  ui.confirm(false); await handle("init", ui.ctx);
+  assert.equal(await exists(path.join(root, ".ship")), false);
+  ui.confirm(true); ui.prompts.push("brief.md"); await handle("init", ui.ctx);
+  assert.equal((await loadState(root)).phase, "idle");
+  assert.equal(await readFile(path.join(root, ".ship", "PROJECT.md"), "utf8"), "Implement a local project.");
+  ui.prompts.push("brief.md"); await handle("init", ui.ctx);
+  assert.match(ui.notices.at(-1)?.message ?? "", /already exists/);
+  assert.equal((await loadState(root)).phase, "idle");
+  await handle("run", ui.ctx);
+  assert.equal((await loadState(root)).phase, "planning");
+});
+
+test("pre-native config retains budgets while ignoring obsolete RPC worker settings", async t => {
+  const root = await fixture(t), config = await loadConfig(root);
+  config.limits.maxDispatches = 1;
+  await atomicJson(configPath(root), { ...config, worker: { command: "not-installed", args: [], startupTimeoutMs: 1, inactivityTimeoutMs: 1, hardTimeoutMs: 1 }, review: false });
+  const api = harness(), ui = context(root);
+  await api.handle("run", ui.ctx);
+  const state = await loadState(root);
+  assert.equal(state.phase, "planning");
+  assert.equal(state.dispatches, 1);
+  assert.match(api.messages.at(-1) ?? "", /OMP-native planning/);
+});
+
+test("/ship recover refuses a live owner and clears only a confirmed-dead lock", async t => {
+  const root = await fixture(t), ui = context(root), handle = command();
+  const lock = path.join(root, ".ship", "lock");
+  await mkdir(lock);
+  await writeFile(path.join(lock, "owner.json"), JSON.stringify({ pid: process.pid, host: hostname() }));
+  await handle("recover", ui.ctx);
+  assert.match(ui.notices.at(-1)?.message ?? "", /still be alive/);
+  assert.equal(await exists(lock), true);
+  await writeFile(path.join(lock, "owner.json"), JSON.stringify({ pid: 2147483000, host: hostname() }));
+  ui.confirm(false); await handle("recover", ui.ctx);
+  assert.equal(await exists(lock), true);
+  ui.confirm(true); await handle("recover", ui.ctx);
+  assert.equal(await exists(lock), false);
+});
+
 test("/ship help and status report actual project state from a nested directory", async t => {
   const root = await fixture(t);
   const nested = path.join(root, "nested"); await mkdir(nested);
@@ -76,7 +121,7 @@ test("/ship help and status report actual project state from a nested directory"
   assert.equal(ui.notices[1].type, "warning");
 });
 
-test("/ship status remains usable for a valid roadmap larger than the CLI output limit", async t => {
+test("/ship status summarizes a large roadmap without overflowing the UI", async t => {
   const root = await fixture(t), state = await loadState(root);
   const raw = JSON.parse(plan());
   const slice = raw.milestones[0].slices[0];
@@ -119,7 +164,7 @@ test("/ship add and change queue selected concrete IDs, revision and field value
   assert.ok(ui.notices.every(notice => /queued.*not applied yet/.test(notice.message)));
 });
 
-test("/ship run dispatches OMP-native assignments without a controller CLI", async t => {
+test("/ship run dispatches OMP-native assignments", async t => {
   const root = await fixture(t), state = await loadState(root);
   state.milestones = parsePlan(plan()); state.roadmapRevision = 1; await saveState(root, state);
   const api = harness(), ui = context(root);
@@ -134,7 +179,7 @@ test("/ship run dispatches OMP-native assignments without a controller CLI", asy
   assert.equal(active.milestones[0].slices[0].tasks[0].status, "running");
 });
 
-test("/ship cancelled edits and CLI failures do not claim a queued change", async t => {
+test("/ship cancelled edits and invalid input never claim a queued change", async t => {
   const root = await fixture(t), state = await loadState(root);
   state.milestones = parsePlan(plan()); state.roadmapRevision = 2; await saveState(root, state);
   const ui = context(root), handle = command();
@@ -308,7 +353,7 @@ test("fresh native project plans through OMP before assigning work", async t => 
   assert.equal(state.nativeBatch?.assignments[0].key, "M001/S01/T01");
 });
 
-test("fully reported interrupted batch settles on restart without rerunning the worker", async t => {
+test("fully reported interrupted batch settles on restart without redispatching", async t => {
   const root = await fixture(t), state = await loadState(root);
   state.milestones = parsePlan(plan()); state.roadmapRevision = 1; await saveState(root, state);
   const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
@@ -324,12 +369,10 @@ test("fully reported interrupted batch settles on restart without rerunning the 
   assert.equal(recovered.nativeBatch, undefined);
 });
 
-test("standalone controller and incompatible worktree cannot overlap an OMP-native batch", async t => {
+test("incompatible standalone worktree cannot be reused in OMP's checkout", async t => {
   const root = await fixture(t), state = await loadState(root);
   state.milestones = parsePlan(plan()); state.roadmapRevision = 1; await saveState(root, state);
   const api = harness(), ui = context(root); await api.handle("run", ui.ctx);
-  const controller = new Controller(root, { async run() { throw new Error("Worker must not start"); } });
-  await assert.rejects(controller.step(), /OMP-native batch/);
   const current = await loadState(root);
   assert.equal(current.phase, "executing");
   assert.equal(current.nativeBatch?.assignments[0].status, "pending");

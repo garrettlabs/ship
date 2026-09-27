@@ -1,5 +1,5 @@
-// A gated process-group leader. The controller records ownership BEFORE sending
-// start. On Windows the job helper assigns this idle host before any worker starts.
+// Gated verification process-group leader. SHIP records ownership BEFORE
+// starting the check; Windows assigns this idle host to a kill-on-close job.
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";

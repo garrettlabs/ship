@@ -1,17 +1,11 @@
 {
   "name": "ship-autopilot",
   "version": "0.2.0",
-  "description": "File-backed autonomous development controller using OMP as disposable coding workers.",
+  "description": "Persistent planning and verification policy for OMP-native coding agents.",
   "type": "module",
-  "bin": {
-    "ship": "./src/cli.ts"
-  },
   "scripts": {
-    "ship": "node --no-warnings --experimental-strip-types src/cli.ts",
     "test": "node --no-warnings --experimental-strip-types --test test/*.test.ts",
-    "check": "tsc --noEmit",
-    "demo": "node --no-warnings --experimental-strip-types scripts/demo.ts",
-    "smoke": "node --no-warnings --experimental-strip-types scripts/smoke.ts"
+    "check": "tsc --noEmit"
   },
   "engines": {
     "node": ">=22.6"
