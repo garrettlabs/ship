@@ -119,7 +119,7 @@ export function tasks(state: ShipState) {
 export function applyRoadmapEdit(state: ShipState, edit: RoadmapEdit): void {
   if (!state.milestones.length) throw new Error("Roadmap has not been loaded");
   if (!Number.isSafeInteger(edit.revision) || edit.revision < 0 || edit.revision !== state.roadmapRevision) throw new Error(`Stale roadmap revision: requested ${edit.revision}, current ${state.roadmapRevision}`);
-  if (state.activeAttempt) throw new Error("Cannot edit roadmap during an active attempt");
+  if (state.activeAttempt || state.nativeBatch || state.nativePlanning) throw new Error("Cannot edit roadmap during an active attempt, native batch or planning assignment");
   // A rejected graph or malformed hint must leave the authoritative plan untouched.
   const plan = structuredClone(state.milestones);
   const hints = { taskType: edit.taskType, uncertainty: edit.uncertainty, dependencies: edit.dependencies, affectedFiles: edit.affectedFiles, affectedDomains: edit.affectedDomains, verificationRequirements: edit.verificationRequirements };

@@ -48,6 +48,7 @@ export class Controller {
   private async advance(): Promise<Step> {
     await assertNoProcess(this.root);
     const s = await loadState(this.root), config = await loadConfig(this.root);
+    if (s.nativeBatch || s.nativePlanning) throw new Error("OMP-native batch or planning assignment is active; finish it in its owning OMP session before running the standalone controller");
     await consumeInbox(this.root, s);
     if (s.paused || this.options.signal?.aborted) return "paused";
     if (s.phase === "blocked") return "blocked";

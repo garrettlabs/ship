@@ -72,7 +72,7 @@ export async function consumeInbox(root: string, state: ShipState): Promise<void
     else if (msg.type === "resume") { state.paused = false; if (state.phase === "blocked") { state.phase = "idle"; delete state.blockedReason; } }
     else if (msg.type === "capture" && typeof msg.note === "string" && msg.note.trim()) state.knowledge.push({ id: `K${String(state.knowledge.length + 1).padStart(4, "0")}`, kind: "capture", text: msg.note, source: "user", evidence: `inbox/${file}`, at: msg.at });
     else if (msg.type === "add" || msg.type === "change") {
-      if (state.activeAttempt) continue;
+      if (state.activeAttempt || state.nativeBatch || state.nativePlanning) continue;
       try {
         const allowed = ["id", "type", "at", "goal", "revision", "taskType", "uncertainty", "dependencies", "affectedFiles", "affectedDomains", "verificationRequirements", ...(msg.type === "add" ? ["slice", "title", "acceptance", "check"] : ["task"])];
         if (Object.keys(msg).some(key => !allowed.includes(key))) throw new Error("Roadmap edit contains forbidden fields");
