@@ -1,8 +1,9 @@
-import { access, realpath } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { exists, loadState, queueMessage, queueRoadmapEdit, shipDir } from "../src/store.ts";
-import { initialize } from "../src/project.ts";
+import { bootstrap, initialize } from "../src/project.ts";
+import { git } from "../src/git.ts";
 import { recoverLock } from "../src/lock.ts";
 import { completeNativeJudgment, confirmNativeSpecialist, recoverNativeRun, reportNativeOutcome, routeNativeSpawn, startNativeRun, submitNativePlan, type NativeOutcome, type RoutingContext } from "../src/native-execution.ts";
 import type { ExecutionRole, RoadmapEdit } from "../src/types.ts";
@@ -11,14 +12,12 @@ import { hashJudgmentRequest } from "../src/judgment.ts";
 async function projectRoot(cwd: string): Promise<string> {
   let current = await realpath(cwd);
   while (true) {
-    try {
-      await access(path.join(current, ".ship", "state.json"));
-      return current;
-    } catch {
-      const parent = path.dirname(current);
-      if (parent === current) throw new Error(`No Ship project (.ship/state.json) found above ${cwd}`);
-      current = parent;
-    }
+    if (await exists(path.join(current, ".ship", "state.json"))) return current;
+    if (await exists(path.join(current, ".ship"))) throw new Error(`Existing .ship directory in ${current} has no valid state; inspect it before proceeding`);
+    if (await exists(path.join(current, ".git"))) throw new Error(`No Ship project (.ship/state.json) found above ${cwd}`);
+    const parent = path.dirname(current);
+    if (parent === current) throw new Error(`No Ship project (.ship/state.json) found above ${cwd}`);
+    current = parent;
   }
 }
 
@@ -31,7 +30,7 @@ function isNativeOutcome(value: unknown): value is NativeOutcome {
     typeof value.summary === "string";
 }
 
-const help = "Ship commands: /ship init (initialize from a project brief); /ship run (trigger native OMP planning and task dispatch); /ship add and /ship change (queue safe-boundary roadmap edits); /ship status (inspect persisted progress); /ship pause and /ship resume (safe-boundary stop/recovery); /ship recover (only after confirming all former OMP workers are dead; reconcile lost native work and clear a dead SHIP lock). OMP owns agents and sessions.";
+const help = "Ship commands: /ship add \"request\" or /ship change \"request\" (adopt a repository and plan on first use); /ship init (optional initialization from a brief); /ship run (trigger native OMP planning and task dispatch); /ship add and /ship change (queue safe-boundary roadmap edits after planning); /ship status (inspect persisted progress); /ship pause and /ship resume (safe-boundary stop/recovery); /ship recover (only after confirming all former OMP workers are dead; reconcile lost native work and clear a dead SHIP lock). OMP owns agents and sessions.";
 const assignmentName = /^Ship([0-9a-f]{26})$/;
 function taskItems(input: Record<string, unknown>): Record<string, unknown>[] {
   return Array.isArray(input.tasks) ? input.tasks.filter((item): item is Record<string, unknown> => item !== null && typeof item === "object")
@@ -185,7 +184,8 @@ export function createShipExtension() {
     api.registerCommand("ship", {
       description: "Initialize and manage native Ship project planning (/ship for help)",
       async handler(args: string, ctx: ExtensionCommandContext): Promise<void> {
-        const action = args.trim() || "help";
+        const [action = "help", ...rest] = args.trim().split(/\s+/);
+        const initialRequest = rest.join(" ").trim().replace(/^(['"])(.*)\1$/, "$2");
         if (action === "help") { ctx.ui.notify(help, "info"); return; }
         if (!["init", "status", "run", "pause", "resume", "recover", "add", "change"].includes(action)) {
           ctx.ui.notify(`Unknown Ship command: ${action}. ${help}`, "error"); return;
@@ -205,7 +205,23 @@ export function createShipExtension() {
             ctx.ui.notify("SHIP initialized. Use /ship run to plan and dispatch tasks in this OMP session.", "info");
             return;
           }
-          const root = await projectRoot(ctx.cwd);
+          let root: string;
+          try { root = await projectRoot(ctx.cwd); }
+          catch (error) {
+            if (!["add", "change"].includes(action) || !(error instanceof Error) || !error.message.startsWith("No Ship project")) throw error;
+            root = await git(ctx.cwd, ["rev-parse", "--show-toplevel"]).catch(() => realpath(ctx.cwd));
+            if (await exists(shipDir(root))) throw new Error("Existing .ship directory has no valid state; inspect it before adopting this repository");
+            if (ctx.agent.kind !== "main") throw new Error("Adopt a project from the main OMP session");
+            const request = initialRequest || await ctx.ui.input("What should SHIP change?", "Describe the requested change in this existing project");
+            if (request === undefined) return;
+            if (!request.trim()) throw new Error("A change request is required to start planning");
+            ctx.ui.notify("SHIP · learning project", "info");
+            await bootstrap(root, request);
+            const next = await startNativeRun(root, ctx.sessionManager.getSessionId());
+            if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
+            ctx.ui.notify(next.startsWith("SHIP OMP-native") ? "SHIP · project profile ready; planning change" : next, next.startsWith("SHIP blocked") ? "warning" : "info");
+            return;
+          }
           if (action === "recover") {
             if (ctx.agent.kind !== "main") throw new Error("Recover SHIP from the main OMP session");
             if (!await ctx.ui.confirm("Destructively recover dead OMP work?", "Only continue after confirming the former OMP session AND every outstanding worker are dead; SHIP cannot inspect OMP worker liveness. Pending assignments will be marked failed, their paid attempts consumed, and the batch transferred to this session; recovery may immediately dispatch another paid assignment. A budget-blocked review remains pending. Recovery refuses a live SHIP lock owner.")) return;

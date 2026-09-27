@@ -88,6 +88,8 @@ export interface ShipState {
   schemaVersion: 1; projectName: string; phase: RunPhase; roadmapRevision: number;
   milestones: Milestone[]; current?: { milestoneId: string; sliceId: string; taskId?: string };
   repoChecks?: RepoCheck[];
+  /** Git state observed before SHIP first planned work; never treats these paths as SHIP-owned. */
+  preexistingWork?: { branch: string | null; paths: string[]; truncated?: boolean; unknown?: boolean };
   paused: boolean; blockedReason?: string; lastProgressAt: string; createdAt: string; updatedAt: string;
   workspace?: { path: string; branch: string; baseHead: string };
   lastHead?: string; partialTree?: string; activeAttempt?: Attempt; dispatches?: number; planningFailures?: number;
