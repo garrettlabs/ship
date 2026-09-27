@@ -17,7 +17,7 @@ export async function initialize(root: string, briefFile: string): Promise<void>
   const config: ShipConfig = {
     schemaVersion: 1,
     limits: { maxTaskAttempts: 3, maxDispatches: 100 },
-    verificationTimeoutMs: 300000, protectedChecks: [],
+    verificationTimeoutMs: 300000, protectedChecks: [], judgment: { enabled: false, confidenceThreshold: 0.7, timeoutMs: 20_000 },
   };
   const now = new Date().toISOString();
   const state: ShipState = {

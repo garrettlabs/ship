@@ -4,8 +4,9 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-
 import { exists, loadState, queueMessage, queueRoadmapEdit, shipDir } from "../src/store.ts";
 import { initialize } from "../src/project.ts";
 import { recoverLock } from "../src/lock.ts";
-import { confirmNativeSpecialist, recoverNativeRun, reportNativeOutcome, routeNativeSpawn, startNativeRun, submitNativePlan, type NativeOutcome } from "../src/native-execution.ts";
-import type { RoadmapEdit } from "../src/types.ts";
+import { completeNativeJudgment, confirmNativeSpecialist, recoverNativeRun, reportNativeOutcome, routeNativeSpawn, startNativeRun, submitNativePlan, type NativeOutcome, type RoutingContext } from "../src/native-execution.ts";
+import type { ExecutionRole, RoadmapEdit } from "../src/types.ts";
+import { hashJudgmentRequest } from "../src/judgment.ts";
 
 async function projectRoot(cwd: string): Promise<string> {
   let current = await realpath(cwd);
@@ -41,7 +42,34 @@ function taskItems(input: Record<string, unknown>): Record<string, unknown>[] {
 export function createShipExtension() {
   return (api: ExtensionAPI): void => {
     const z = api.zod;
+    const routing = (ctx: { models: { resolve: (alias: string) => { id: string; cost?: { input?: number; output?: number } } | undefined } }): RoutingContext => {
+      const roles: ExecutionRole[] = ["smol", "task", "slow"];
+      return { jevAvailable: api.getAllTools().some(tool => tool.name === "jev_ask") && api.getActiveTools().includes("jev_ask"),
+        candidates: roles.flatMap(role => {
+          const model = ctx.models.resolve(`@${role}`);
+          return model ? [{ role, model: model.id, ...(model.cost && Number.isFinite(model.cost.input) && Number.isFinite(model.cost.output)
+            ? { pricing: { input: model.cost.input!, output: model.cost.output! } } : {}) }] : [];
+        }) };
+    };
     const pendingJobs = new Map<string, { root: string; sessionId: string; assignmentId: string; agent: string }>();
+    api.on("tool_result", async (event, ctx) => {
+      if (ctx.agent.kind !== "main" || event.toolName !== "jev_ask") return;
+      const root = await projectRoot(ctx.cwd).catch(() => undefined);
+      if (!root) return;
+      const pending = (await loadState(root)).pendingJudgment;
+      if (!pending || pending.sessionId !== ctx.sessionManager.getSessionId()) return;
+      const input = event.input;
+      if (!input || typeof input !== "object" || !("state" in input) || !input.state ||
+          typeof input.state !== "object" || !("correlation" in input.state) ||
+          input.state.correlation !== pending.id) return;
+      try {
+        const status = hashJudgmentRequest(input) !== pending.requestHash ? "malformed" : event.isError ? "error" : "result";
+        const next = await completeNativeJudgment(root, pending.sessionId, pending.id, status, event.details, routing(ctx));
+        if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
+      } catch (error) {
+        ctx.ui.notify(`SHIP judgment could not advance: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
+    });
     api.on("tool_result", async (event, ctx) => {
       if (ctx.agent.kind !== "main" || event.isError || (event.toolName !== "task" && event.toolName !== "wait")) return;
       const sessionId = ctx.sessionManager.getSessionId();
@@ -106,11 +134,29 @@ export function createShipExtension() {
           if (!params || typeof params !== "object" || !("planningId" in params) || typeof params.planningId !== "string" ||
               !("plan" in params) || typeof params.plan !== "string") throw new Error("Invalid SHIP plan fields");
           const root = await projectRoot(ctx.cwd);
-          const next = await submitNativePlan(root, ctx.sessionManager.getSessionId(), params.planningId, params.plan);
+          const next = await submitNativePlan(root, ctx.sessionManager.getSessionId(), params.planningId, params.plan, routing(ctx));
           if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
           return { content: [{ type: "text", text: next }] };
         } catch (error) {
           return { content: [{ type: "text", text: `SHIP plan rejected: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+        }
+      },
+    });
+    api.registerTool({
+      name: "ship_judgment",
+      label: "Report unavailable Jev judgment",
+      description: "Report that the public jev_ask tool cannot be called for an outstanding SHIP routing request; SHIP falls back deterministically. Never use this to supply a fabricated judgment.",
+      parameters: z.object({ id: z.string(), status: z.literal("unavailable") }),
+      async execute(_id, params, _signal, _update, ctx) {
+        try {
+          if (ctx.agent.kind !== "main" || !params || typeof params !== "object" || !("status" in params) || params.status !== "unavailable" ||
+              !("id" in params) || typeof params.id !== "string") throw new Error("Only the main session may report unavailable judgment");
+          const root = await projectRoot(ctx.cwd);
+          const next = await completeNativeJudgment(root, ctx.sessionManager.getSessionId(), params.id, "unavailable", undefined, routing(ctx));
+          if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
+          return { content: [{ type: "text", text: next }] };
+        } catch (error) {
+          return { content: [{ type: "text", text: `SHIP judgment rejected: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
         }
       },
     });
@@ -128,7 +174,7 @@ export function createShipExtension() {
           if (!isNativeOutcome(params)) throw new Error("Invalid SHIP outcome fields");
           if (ctx.agent.kind !== "main") throw new Error("Only the main OMP session can report SHIP assignments");
           const root = await projectRoot(ctx.cwd);
-          const next = await reportNativeOutcome(root, ctx.sessionManager.getSessionId(), params);
+          const next = await reportNativeOutcome(root, ctx.sessionManager.getSessionId(), params, routing(ctx));
           if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
           return { content: [{ type: "text", text: next }] };
         } catch (error) {
@@ -164,7 +210,7 @@ export function createShipExtension() {
             if (ctx.agent.kind !== "main") throw new Error("Recover SHIP from the main OMP session");
             if (!await ctx.ui.confirm("Destructively recover dead OMP work?", "Only continue after confirming the former OMP session AND every outstanding worker are dead; SHIP cannot inspect OMP worker liveness. Pending assignments will be marked failed, their paid attempts consumed, and the batch transferred to this session; recovery may immediately dispatch another paid assignment. A budget-blocked review remains pending. Recovery refuses a live SHIP lock owner.")) return;
             if (await exists(path.join(shipDir(root), "lock"))) await recoverLock(root);
-            const next = await recoverNativeRun(root, ctx.sessionManager.getSessionId());
+            const next = await recoverNativeRun(root, ctx.sessionManager.getSessionId(), routing(ctx));
             if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
             ctx.ui.notify(next.startsWith("SHIP OMP-native") ? "SHIP recovered dead work and sent the next assignment to this OMP session." : next, next.startsWith("SHIP blocked") ? "warning" : "info");
             return;
@@ -178,7 +224,7 @@ export function createShipExtension() {
           if (action === "run") {
             if (ctx.agent.kind !== "main") throw new Error("Run SHIP from the main OMP session");
             if (!await ctx.ui.confirm("Start Ship in this OMP session?", "Dispatch ready tasks using OMP task agents? Model calls may be paid.")) return;
-            const next = await startNativeRun(root, ctx.sessionManager.getSessionId());
+            const next = await startNativeRun(root, ctx.sessionManager.getSessionId(), routing(ctx));
             if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
             ctx.ui.notify(next.startsWith("SHIP OMP-native") ? "SHIP native planning/task assignment sent to this OMP session." : next, next.startsWith("SHIP blocked") ? "warning" : "info");
             return;
