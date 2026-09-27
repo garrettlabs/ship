@@ -24,11 +24,46 @@ export async function atomicJson(file: string, value: unknown): Promise<void> {
   } finally { await unlink(tmp).catch(() => {}); }
 }
 export async function readJson<T>(file: string): Promise<T> { return JSON.parse(await readFile(file, "utf8")) as T; }
+function validateNativeState(s: ShipState): void {
+  const invalid = (detail: string): never => { throw new Error(`Invalid persisted native state: ${detail}`); };
+  const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
+  const label = (value: unknown): value is string => typeof value === "string" && !!value.trim();
+  const count = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+  if (!["idle", "planning", "executing", "verifying", "reviewing", "blocked", "complete"].includes(s.phase)) invalid("phase");
+  if (!count(s.roadmapRevision) || (s.dispatches !== undefined && !count(s.dispatches)) || (s.planningFailures !== undefined && !count(s.planningFailures))) invalid("counters");
+  if (s.nativePlanning !== undefined) {
+    const p = s.nativePlanning;
+    if (!record(p) || !label(p.id) || !label(p.sessionId) || !count(p.attempts) || s.nativeBatch || s.milestones.length || !["planning", "blocked", "idle"].includes(s.phase)) invalid("planning assignment");
+  }
+  if (s.nativeBatch !== undefined) {
+    const b = s.nativeBatch;
+    if (!record(b) || !label(b.id) || !label(b.sessionId) || !count(b.revision) || b.revision !== s.roadmapRevision ||
+        !["executing", "reviewing"].includes(b.stage) || !Array.isArray(b.assignments) || !b.assignments.length ||
+        (b.settling !== undefined && typeof b.settling !== "boolean") || (b.awaitingBudget !== undefined && typeof b.awaitingBudget !== "boolean") ||
+        (b.awaitingBudget && (b.stage !== "reviewing" || b.settling || b.assignments.some(a => a?.status !== "pending"))) ||
+        (b.settling && b.assignments.some(a => a?.status === "pending")) ||
+        !["executing", "verifying", "idle", "blocked"].includes(s.phase)) invalid("batch");
+    const known = new Map(tasks(s).map(item => [item.key, item.t]));
+    const ids = new Set<string>(), keys = new Set<string>();
+    for (const a of b.assignments) {
+      if (!record(a) || !label(a.id) || !label(a.key) || ids.has(a.id) || keys.has(a.key) ||
+          !["pending", "passed", "failed", "partial"].includes(a.status) ||
+          (a.status === "pending" ? a.summary !== undefined : !label(a.summary)) ||
+          (a.routed !== undefined && typeof a.routed !== "boolean") ||
+          (a.specialistDispatched !== undefined && typeof a.specialistDispatched !== "boolean") ||
+          !known.has(a.key) || !["running", "verifying"].includes(known.get(a.key)!.status) ||
+          (b.stage === "reviewing" && known.get(a.key)!.status !== "verifying")) invalid("batch assignment");
+      ids.add(a.id); keys.add(a.key);
+    }
+  }
+}
+
 export async function loadState(root: string): Promise<ShipState> {
   const s = await readJson<ShipState>(statePath(root));
-  if (s.schemaVersion !== 1 || !Array.isArray(s.milestones) || typeof s.paused !== "boolean" || !Number.isInteger(s.roadmapRevision)) throw new Error("Invalid state.json");
+  if (!s || s.schemaVersion !== 1 || !Array.isArray(s.milestones) || typeof s.paused !== "boolean" || !Number.isInteger(s.roadmapRevision)) throw new Error("Invalid state.json");
   if (s.repoChecks !== undefined && (!Array.isArray(s.repoChecks) || s.repoChecks.some(c => !c || !["focused-tests", "broader-tests", "typecheck", "lint", "build", "integration"].includes(c.kind) || typeof c.command !== "string" || !c.command.trim() || typeof c.source !== "string" || !c.source.trim()))) throw new Error("Invalid persisted repo checks");
   if (s.milestones.length) s.milestones = normalizePlan(s.milestones, false, s.repoChecks);
+  validateNativeState(s);
   s.knowledge ??= []; s.processedInbox ??= []; s.dispatches ??= 0; s.planningFailures ??= 0;
   return s;
 }

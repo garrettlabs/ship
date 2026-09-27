@@ -8,6 +8,7 @@ import { runCheck } from "./process.ts";
 import { acquireLock } from "./lock.ts";
 import { discoverRepoChecks } from "./verification.ts";
 import { appendEvent, atomicJson, consumeInbox, loadConfig, loadState, saveState, shipDir, writeRoadmapView } from "./store.ts";
+import { assertNoProcess } from "./process.ts";
 import type { Milestone, NativeAssignment, NativeBatch, RepoCheck, ShipConfig, ShipState } from "./types.ts";
 
 export interface NativeOutcome { batchId: string; assignmentId: string; status: "passed" | "failed" | "partial"; summary: string; }
@@ -37,11 +38,11 @@ function instructions(root: string, batch: NativeBatch, state: ShipState): strin
     const task = entries.find(entry => entry.key === assignment.key)!.t;
     const prerequisites = graph.dependencies.get(assignment.key)!;
     const name = `Ship${assignment.id.replaceAll("-", "").slice(0, 26)}`;
-    if (batch.stage === "reviewing") return `- ${assignment.key} [${assignment.id}]: Independently review completed work against: ${task.acceptance.join("; ")}. ${task.verificationPlan.requirements.filter(r => !r.command).map(r => `${r.kind}: ${r.reason}`).join("; ")}. Use OMP task tool agent: "${task.execution.verificationSpecialist ?? "reviewer"}", name: "${name}", not the original writer; await substantive review findings before reporting.`;
+    if (batch.stage === "reviewing") return `- ${assignment.key} [${assignment.id}]: Independently review completed work against: ${task.acceptance.join("; ")}. ${task.verificationPlan.requirements.filter(r => !r.command).map(r => `${r.kind}: ${r.reason}`).join("; ")}. Use OMP task tool agent: "${task.execution.verificationSpecialist ?? "reviewer"}", name: "${name}", and include assignment ID ${assignment.id} in its task text; not the original writer. Await substantive review findings before reporting.`;
     const route = task.execution;
     const agent = route.specialist ?? (route.role === "smol" ? "sonic" : "task");
     const dispatch = route.mode === "main" ? "Work directly in the main session without a subagent"
-      : `Use OMP task tool with agent: "${agent}", name: "${name}"${route.role === "plan" || route.role === "slow" ? `; SHIP's public before_subagent_spawn hook resolves its configured @${route.role} model role` : ""}, await its actual result`;
+      : `Use OMP task tool with agent: "${agent}", name: "${name}", and include assignment ID ${assignment.id} in its task text${route.role === "plan" || route.role === "slow" ? `; SHIP's public before_subagent_spawn hook resolves its configured @${route.role} model role` : ""}, await its actual result`;
     return `- ${assignment.key} [${assignment.id}]: ${task.title}. Goal: ${task.goal}. Objective: ${task.objective}. Acceptance: ${task.acceptance.join("; ")}. Dependencies already passed: ${prerequisites.join(", ") || "none"}. Owned files: ${task.affectedFiles.join(", ") || "unspecified"}; domains: ${task.affectedDomains.join(", ") || "unspecified"}. ${dispatch}. Stored route: ${route.role}${route.specialist ? `/${route.specialist}` : ""}; ${route.reason}. ${task.lastError ? `Previous failure (repair only within scope): ${task.lastError}` : ""}`;
   });
   const reporting = `After each assignment finishes, call ship_outcome with batchId ${batch.id}, its assignmentId, status passed/failed/partial, and a concrete summary of actual results. Report failures and partial work honestly; do not claim success from intention. SHIP runs required verification itself and will issue a follow-up batch only after every assignment has reported. Do not launch any separate SHIP process for these assignments.`;
@@ -96,9 +97,28 @@ async function advance(root: string, state: ShipState, config: ShipConfig, sessi
       state.dispatches = (state.dispatches ?? 0) + 1;
     }
     state.phase = "planning"; await persist(root, state, "native_planning_started", { planning: state.nativePlanning.id });
-    return `SHIP OMP-native planning for ${root}. Use OMP task tool agent: "task", name: "ShipPlanner" to inspect without modifying files, then call ship_plan with planningId ${state.nativePlanning.id} and its complete JSON plan. ${plannerPrompt(await readFile(path.join(shipDir(root), "PROJECT.md"), "utf8"))}`;
+    return `SHIP OMP-native planning for ${root}. Use OMP task tool agent: "task", name: "ShipPlanner", to inspect without modifying files. Pass the entire planner task text below verbatim as the task agent's task prompt; do not summarize it or replace its JSON contract with a prose request. Await the agent's final answer, which MUST be raw JSON only (no Markdown, fences, or commentary) with the full milestones -> slices -> tasks schema below. In the main session, call ship_plan with planningId ${state.nativePlanning.id} and plan set to that complete raw JSON answer, not a Markdown summary or a partial plan.\n\nPLANNER TASK TEXT (pass everything below verbatim):\n${plannerPrompt(await readFile(path.join(shipDir(root), "PROJECT.md"), "utf8"))}`;
   }
-  if (tasks(state).every(entry => entry.t.status === "passed")) { state.phase = "complete"; await persist(root, state, "project_completed"); return "SHIP complete: all tasks passed required verification."; }
+  if (tasks(state).every(entry => entry.t.status === "passed")) {
+    const checks = [...new Set((state.repoChecks ?? []).filter(check => check.kind === "integration").map(check => check.command))];
+    for (const [index, command] of checks.entries()) {
+      const directory = path.join(shipDir(root), "attempts");
+      await mkdir(directory, { recursive: true });
+      let result;
+      try { result = await runCheck(root, command, root, config.verificationTimeoutMs ?? 300_000, undefined, path.join(directory, `native-integration-${index}.log`)); }
+      catch (error) {
+        state.phase = "blocked"; state.blockedReason = `Integration check could not execute: ${command}: ${String(error)}`;
+        await persist(root, state, "integration_failed", { command }); return `SHIP blocked: ${state.blockedReason}`;
+      }
+      await atomicJson(path.join(directory, `native-integration-${index}.json`), { command, ok: result.ok, code: result.code, output: result.output });
+      if (!result.ok) {
+        state.phase = "blocked"; state.blockedReason = `Integration check ${result.timedOut ? "timed out" : "failed"}: ${command}\n${result.output}`;
+        await persist(root, state, "integration_failed", { command }); return `SHIP blocked: ${state.blockedReason}`;
+      }
+    }
+    state.phase = "complete"; delete state.blockedReason;
+    await persist(root, state, "project_completed"); return "SHIP complete: all tasks passed required verification and configured integration checks.";
+  }
   const batch = chooseBatch(state, config, sessionId);
   if (!batch) {
     const graph = new DependencyGraph(state.milestones);
@@ -118,6 +138,39 @@ export function startNativeRun(root: string, sessionId: string): Promise<string>
     if (state.activeAttempt) throw new Error("A standalone controller attempt is active; reconcile it before OMP-native execution");
     await consumeInbox(root, state);
     return advance(root, state, await loadConfig(root), sessionId);
+  });
+}
+/** Explicit recovery is allowed only after the caller confirms every former OMP worker is dead. */
+export function recoverNativeRun(root: string, sessionId: string): Promise<string> {
+  return serialized(root, async () => {
+    await assertNoProcess(root);
+    const state = await loadState(root), config = await loadConfig(root);
+    if (state.workspace || state.activeAttempt) throw new Error("Standalone execution requires separate recovery");
+    if (state.nativeBatch) {
+      const batch = state.nativeBatch;
+      if (batch.awaitingBudget) {
+        batch.sessionId = sessionId;
+        await persist(root, state, "native_review_recovered", { batch: batch.id });
+        return `SHIP blocked: ${state.blockedReason}`;
+      }
+      if (batch.assignments.some(a => a.status === "pending")) {
+        for (const assignment of batch.assignments) if (assignment.status === "pending") {
+          assignment.status = "failed"; assignment.summary = "Worker terminated without reporting; explicitly recovered after confirming it is dead";
+        }
+        batch.settling = true;
+      }
+      batch.sessionId = sessionId;
+      await persist(root, state, "native_worker_recovered", { batch: batch.id });
+    } else if (state.nativePlanning) {
+      state.planningFailures = (state.planningFailures ?? 0) + 1;
+      delete state.nativePlanning;
+      state.phase = "idle";
+      await persist(root, state, "native_planning_recovered");
+    }
+    if (state.phase === "blocked" && state.nativeBatch?.awaitingBudget) return `SHIP blocked: ${state.blockedReason}`;
+    if (state.phase === "blocked") { state.phase = "idle"; delete state.blockedReason; }
+    await consumeInbox(root, state);
+    return advance(root, state, config, sessionId);
   });
 }
 export function submitNativePlan(root: string, sessionId: string, planningId: string, plan: string): Promise<string> {
@@ -153,7 +206,7 @@ export function submitNativePlan(root: string, sessionId: string, planningId: st
 }
 
 
-/** The public spawn event supplies a per-spawn key derived from the requested agent name. */
+/** The public spawn event only routes a proposed child; it never proves completion. */
 export function routeNativeSpawn(root: string, sessionId: string, spawnKey: string | undefined, agent: string, available: (alias: string) => boolean): Promise<string | undefined> {
   if (!spawnKey?.includes("Ship")) return Promise.resolve(undefined);
   return serialized(root, async () => {
@@ -165,12 +218,29 @@ export function routeNativeSpawn(root: string, sessionId: string, spawnKey: stri
     const expected = batch.stage === "reviewing" ? task.execution.verificationSpecialist ?? "reviewer"
       : task.execution.specialist ?? (task.execution.role === "smol" ? "sonic" : "task");
     if (agent !== expected) throw new Error(`SHIP ${assignment.key} requires OMP agent ${expected}, not ${agent}`);
+    // Later OMP hooks may still block this spawn. Only a completed task result
+    // can confirm a specialist, never this pre-spawn routing event.
     if (batch.stage !== "executing" || !["plan", "slow"].includes(task.execution.role)) return undefined;
     const alias = `@${task.execution.role}`;
     if (!available(alias)) throw new Error(`OMP model role ${alias} is unavailable; configure it before dispatching ${assignment.key}`);
     assignment.routed = true;
     await saveState(root, state);
     return alias;
+  });
+}
+
+/** Record only a successfully completed OMP task result, correlated to its named assignment. */
+export function confirmNativeSpecialist(root: string, sessionId: string, assignmentId: string, agent: string): Promise<void> {
+  return serialized(root, async () => {
+    const state = await loadState(root), batch = state.nativeBatch;
+    if (!batch || batch.sessionId !== sessionId || batch.awaitingBudget) return;
+    const assignment = batch.assignments.find(item => item.id === assignmentId && item.status === "pending");
+    if (!assignment) return;
+    const task = tasks(state).find(item => item.key === assignment.key)!.t;
+    const expected = batch.stage === "reviewing" ? task.execution.verificationSpecialist ?? "reviewer" : task.execution.specialist;
+    if (expected !== agent) return;
+    assignment.specialistDispatched = true;
+    await saveState(root, state);
   });
 }
 
@@ -232,6 +302,9 @@ export function reportNativeOutcome(root: string, sessionId: string, outcome: Na
     if (outcome.status === "passed" && batch.stage === "executing" && task.execution.mode === "delegate" &&
         (task.execution.role === "plan" || task.execution.role === "slow") && !assignment.routed) {
       throw new Error(`OMP ${task.execution.role} role was not confirmed by the public spawn event; cannot accept a successful outcome`);
+    }
+    if (outcome.status === "passed" && (batch.stage === "reviewing" || task.execution.specialist) && !assignment.specialistDispatched) {
+      throw new Error(`OMP ${batch.stage === "reviewing" ? "required reviewer" : task.execution.specialist} completed task result was not confirmed; cannot accept a successful outcome`);
     }
     if (!outcome.summary?.trim() || outcome.summary.length > 16_000) throw new Error("Provide a concrete outcome summary (up to 16,000 characters)");
     assignment.status = outcome.status; assignment.summary = outcome.summary;

@@ -1,10 +1,10 @@
 import { access, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
-import { loadState, queueMessage, queueRoadmapEdit } from "../src/store.ts";
+import { exists, loadState, queueMessage, queueRoadmapEdit, shipDir } from "../src/store.ts";
 import { initialize } from "../src/project.ts";
 import { recoverLock } from "../src/lock.ts";
-import { reportNativeOutcome, routeNativeSpawn, startNativeRun, submitNativePlan, type NativeOutcome } from "../src/native-execution.ts";
+import { confirmNativeSpecialist, recoverNativeRun, reportNativeOutcome, routeNativeSpawn, startNativeRun, submitNativePlan, type NativeOutcome } from "../src/native-execution.ts";
 import type { RoadmapEdit } from "../src/types.ts";
 
 async function projectRoot(cwd: string): Promise<string> {
@@ -30,11 +30,60 @@ function isNativeOutcome(value: unknown): value is NativeOutcome {
     typeof value.summary === "string";
 }
 
-const help = "Ship commands: /ship init (initialize from a project brief); /ship run (trigger native OMP planning and task dispatch); /ship add and /ship change (queue safe-boundary roadmap edits); /ship status (inspect persisted progress); /ship pause and /ship resume (safe-boundary stop/recovery); /ship recover (clear a confirmed-dead SHIP lock). OMP owns agents and sessions.";
+const help = "Ship commands: /ship init (initialize from a project brief); /ship run (trigger native OMP planning and task dispatch); /ship add and /ship change (queue safe-boundary roadmap edits); /ship status (inspect persisted progress); /ship pause and /ship resume (safe-boundary stop/recovery); /ship recover (only after confirming all former OMP workers are dead; reconcile lost native work and clear a dead SHIP lock). OMP owns agents and sessions.";
+const assignmentName = /^Ship([0-9a-f]{26})$/;
+function taskItems(input: Record<string, unknown>): Record<string, unknown>[] {
+  return Array.isArray(input.tasks) ? input.tasks.filter((item): item is Record<string, unknown> => item !== null && typeof item === "object")
+    : [input];
+}
+
 
 export function createShipExtension() {
   return (api: ExtensionAPI): void => {
     const z = api.zod;
+    const pendingJobs = new Map<string, { root: string; sessionId: string; assignmentId: string; agent: string }>();
+    api.on("tool_result", async (event, ctx) => {
+      if (ctx.agent.kind !== "main" || event.isError || (event.toolName !== "task" && event.toolName !== "wait")) return;
+      const sessionId = ctx.sessionManager.getSessionId();
+      if (event.toolName === "wait") {
+        const details = event.details as { jobs?: { id?: string; type?: string; status?: string }[] } | undefined;
+        for (const job of details?.jobs ?? []) {
+          const pending = job.id ? pendingJobs.get(job.id) : undefined;
+          if (!pending || pending.sessionId !== sessionId) continue;
+          if (job.status === "running") continue;
+          pendingJobs.delete(job.id!);
+          if (job.type === "task" && job.status === "completed") {
+            await confirmNativeSpecialist(pending.root, sessionId, pending.assignmentId, pending.agent);
+          }
+        }
+        return;
+      }
+      const root = await projectRoot(ctx.cwd).catch(() => undefined);
+      if (!root) return;
+      const batch = (await loadState(root)).nativeBatch;
+      if (!batch || batch.sessionId !== sessionId || batch.awaitingBudget) return;
+      const items = taskItems(event.input);
+      const details = event.details as { results?: { index?: number; id?: string; agent?: string; exitCode?: number; error?: string; aborted?: boolean }[];
+        progress?: { index?: number; id?: string; agent?: string; status?: string }[]; async?: { state?: string } } | undefined;
+      const matched = (index: number | undefined, id: string | undefined, agent: string | undefined) => {
+        const item = items[index ?? -1], name = item?.name;
+        if (typeof name !== "string" || typeof id !== "string" || typeof agent !== "string" ||
+            item.agent !== agent || typeof item.task !== "string" ||
+            !assignmentName.test(name) || !(id === name || id.startsWith(`${name}-`))) return;
+        const assignment = batch.assignments.find(entry => name === `Ship${entry.id.replaceAll("-", "").slice(0, 26)}` && entry.status === "pending");
+        return assignment && item.task.includes(assignment.id) ? assignment.id : undefined;
+      };
+      for (const result of details?.results ?? []) {
+        const assignmentId = matched(result.index, result.id, result.agent);
+        if (assignmentId && result.exitCode === 0 && !result.error && !result.aborted) {
+          await confirmNativeSpecialist(root, sessionId, assignmentId, result.agent!);
+        }
+      }
+      if (details?.async?.state === "running") for (const progress of details.progress ?? []) {
+        const assignmentId = matched(progress.index, progress.id, progress.agent);
+        if (assignmentId && progress.status !== "failed") pendingJobs.set(progress.id!, { root, sessionId, assignmentId, agent: progress.agent! });
+      }
+    });
     api.on("before_subagent_spawn", async (event, ctx) => {
       if (ctx.agent.kind !== "main" || !event.spawnKey?.includes("Ship")) return;
       const root = await projectRoot(ctx.cwd).catch(() => undefined);
@@ -49,7 +98,7 @@ export function createShipExtension() {
     api.registerTool({
       name: "ship_plan",
       label: "Ship execution plan",
-      description: "Submit a complete SHIP plan from the assigned OMP-native planner for validation and task scheduling.",
+      description: "Submit the assigned OMP planner's complete raw JSON answer (not Markdown or fenced text) as plan, with the active planningId. Expected top-level JSON: {\"milestones\":[{\"id\":\"M001\",\"title\":\"...\",\"outcome\":\"...\",\"slices\":[{\"id\":\"S01\",\"title\":\"...\",\"tasks\":[{\"id\":\"T01\",\"title\":\"...\",\"objective\":\"...\",\"goal\":\"...\",\"dependencies\":[],\"acceptance\":[\"...\"],\"affectedDomains\":[],\"affectedFiles\":[],\"taskType\":\"implementation\",\"uncertainty\":\"UNKNOWN\",\"verificationRequirements\":[\"...\"],\"verificationCommands\":[\"...\"]}]}]}]}. Include complete milestones, slices and tasks; no prose, code fences, or status fields.",
       parameters: z.object({ planningId: z.string(), plan: z.string() }),
       async execute(_id, params, _signal, _update, ctx) {
         try {
@@ -112,9 +161,12 @@ export function createShipExtension() {
           }
           const root = await projectRoot(ctx.cwd);
           if (action === "recover") {
-            if (!await ctx.ui.confirm("Recover SHIP lock?", "Only recover after confirming the former OMP session is dead. Recovery will refuse a live lock owner.")) return;
-            await recoverLock(root);
-            ctx.ui.notify("Dead SHIP lock cleared. Use /ship run to reconcile persisted assignments.", "info");
+            if (ctx.agent.kind !== "main") throw new Error("Recover SHIP from the main OMP session");
+            if (!await ctx.ui.confirm("Destructively recover dead OMP work?", "Only continue after confirming the former OMP session AND every outstanding worker are dead; SHIP cannot inspect OMP worker liveness. Pending assignments will be marked failed, their paid attempts consumed, and the batch transferred to this session; recovery may immediately dispatch another paid assignment. A budget-blocked review remains pending. Recovery refuses a live SHIP lock owner.")) return;
+            if (await exists(path.join(shipDir(root), "lock"))) await recoverLock(root);
+            const next = await recoverNativeRun(root, ctx.sessionManager.getSessionId());
+            if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
+            ctx.ui.notify(next.startsWith("SHIP OMP-native") ? "SHIP recovered dead work and sent the next assignment to this OMP session." : next, next.startsWith("SHIP blocked") ? "warning" : "info");
             return;
           }
           if (action === "status") {

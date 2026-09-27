@@ -52,7 +52,7 @@ export type InboxMessage =
   | { id: string; type: "capture"; note: string; at: string }
   | (RoadmapEdit & { id: string; at: string });
 export interface NativeAssignment {
-  id: string; key: string; status: "pending" | "passed" | "failed" | "partial"; summary?: string; routed?: boolean;
+  id: string; key: string; status: "pending" | "passed" | "failed" | "partial"; summary?: string; routed?: boolean; specialistDispatched?: boolean;
 }
 export interface NativeBatch {
   id: string; sessionId: string; revision: number; stage: "executing" | "reviewing"; assignments: NativeAssignment[]; settling?: boolean; awaitingBudget?: boolean;
