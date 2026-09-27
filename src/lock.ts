@@ -10,7 +10,7 @@ export async function acquireLock(root: string): Promise<() => Promise<void>> {
   if (await exists(path.join(shipDir(root), "recovery"))) throw new Error("Recovery in progress");
   const token = randomUUID();
   try { await mkdir(dir); } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new Error("Controller lock exists. Attach with ship tui; after a crash use ship recover, then ship run.");
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new Error("Ship project lock exists. Retry when the owner finishes; if it crashed use /ship recover.");
     throw e;
   }
   if (await exists(path.join(shipDir(root), "recovery"))) { await rm(dir, { recursive: true }); throw new Error("Recovery in progress"); }

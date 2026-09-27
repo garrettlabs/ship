@@ -1,6 +1,7 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { hostname } from "node:os";
 import { fileURLToPath } from "node:url";
+import { accessSync, constants, statSync } from "node:fs";
 import { unlink, open } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -40,12 +41,38 @@ export async function assertNoProcess(root: string): Promise<void> {
   const file = path.join(shipDir(root), "process.json");
   if (!await exists(file)) return;
   const record = await readJson<{ pid: number; host: string; token?: string }>(file);
-  if (record.host !== hostname() || await treeRunning(record.pid, record.token)) throw new Error(`Worker group ${record.pid} may still be alive. Refusing overlapping work; inspect it before recovery.`);
+  if (record.host !== hostname() || await treeRunning(record.pid, record.token)) throw new Error(`Verification group ${record.pid} may still be alive. Refusing overlapping checks; inspect it before recovery.`);
   await unlink(file);
 }
-export async function startProcess(command: string, args: string[], cwd: string, root?: string) {
-  if (root) await assertNoProcess(root);
-  const child = spawn(process.execPath, [fileURLToPath(new URL("./process-host.mjs", import.meta.url))], {
+function nodeExecutable(): string {
+  const executable = process.platform === "win32" ? "node.exe" : "node";
+  const usable = (file: string): boolean => {
+    try {
+      if (!statSync(file).isFile()) return false;
+      accessSync(file, constants.X_OK);
+      return true;
+    } catch { return false; }
+  };
+  const configured = process.env.NODE_BINARY;
+  if (configured) {
+    if (path.isAbsolute(configured) && usable(configured)) return configured;
+    throw new Error(`NODE_BINARY must point to an executable Node.js binary: ${configured}`);
+  }
+  if (path.basename(process.execPath).toLowerCase() === executable && usable(process.execPath)) return process.execPath;
+  // A packaged OMP binary is not a Node executable, even though execPath
+  // points to it. Resolve an actual Node binary without consulting cwd.
+  const pathKey = Object.keys(process.env).find(key => key.toLowerCase() === "path");
+  for (const directory of (pathKey ? process.env[pathKey] : "")?.split(path.delimiter) ?? []) {
+    if (!path.isAbsolute(directory)) continue;
+    const candidate = path.join(directory, executable);
+    if (usable(candidate)) return candidate;
+  }
+  throw new Error("Node.js executable not found for verification supervisor; install Node.js on PATH or set NODE_BINARY to its absolute path");
+}
+
+async function startCheckProcess(command: string, cwd: string, root: string) {
+  await assertNoProcess(root);
+  const child = spawn(nodeExecutable(), [fileURLToPath(new URL("./process-host.mjs", import.meta.url))], {
     cwd, detached: true, windowsHide: true, stdio: ["pipe", "pipe", "pipe", "ipc"], env: process.env,
   }) as ChildProcessWithoutNullStreams;
   child.stdin.on("error", () => {});
@@ -54,18 +81,18 @@ export async function startProcess(command: string, args: string[], cwd: string,
   const closed = completion.promise;
   child.once("error", () => { exited = true; completion.resolve(null); });
   child.once("close", code => { exited = true; completion.resolve(code); });
-  if (!child.pid) { await closed; throw new Error(`Cannot spawn process supervisor for ${command}`); }
+  if (!child.pid) { await closed; throw new Error(`Cannot spawn verification supervisor for ${command}`); }
   const pid = child.pid;
   const token = randomUUID();
-  const marker = root && path.join(shipDir(root), "process.json");
+  const marker = path.join(shipDir(root), "process.json");
   try {
-    if (marker) await atomicJson(marker, { pid, token, host: hostname(), command, at: new Date().toISOString() });
+    await atomicJson(marker, { pid, token, host: hostname(), command, at: new Date().toISOString() });
   } catch (error) { if (process.platform === "win32") child.kill("SIGKILL"); else killGroup(pid, "SIGKILL"); await closed; throw error; }
   let sent = false;
   return {
     child, closed,
     // Install output/error handlers before opening the execution gate.
-    start() { if (!sent) { sent = true; child.send({ type: "start", command, args, token }, () => {}); } },
+    start() { if (!sent) { sent = true; child.send({ type: "start", command: "sh", args: ["-c", command], token }, () => {}); } },
     async stop(): Promise<void> {
       child.stdin.end();
       if (!exited) await Promise.race([closed, delay(300)]);
@@ -77,8 +104,8 @@ export async function startProcess(command: string, args: string[], cwd: string,
       if (process.platform !== "win32" && await treeRunning(pid)) killGroup(pid, "SIGKILL");
       if (!exited) await Promise.race([closed, delay(1500)]);
       for (let i = 0; i < 40 && await treeRunning(pid, token); i++) await delay(50);
-      if (!exited || await treeRunning(pid, token)) throw new Error(`Cannot establish termination of worker group ${pid}; process record retained`);
-      if (marker && await exists(marker)) {
+      if (!exited || await treeRunning(pid, token)) throw new Error(`Cannot establish termination of verification group ${pid}; process record retained`);
+      if (await exists(marker)) {
         const record = await readJson<{ token: string }>(marker);
         if (record.token === token) await unlink(marker);
       }
@@ -86,7 +113,7 @@ export async function startProcess(command: string, args: string[], cwd: string,
   };
 }
 export async function runCheck(cwd: string, command: string, root: string, timeoutMs: number, signal?: AbortSignal, logFile?: string) {
-  const proc = await startProcess("sh", ["-c", command], cwd, root);
+  const proc = await startCheckProcess(command, cwd, root);
   let output = ""; let timedOut = false;
   // Persist a bounded artifact while continuing to drain both pipes.
   let log: Awaited<ReturnType<typeof open>> | undefined;
