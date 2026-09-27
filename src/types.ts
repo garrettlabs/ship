@@ -13,6 +13,10 @@ export interface TaskExecution {
   specialist?: SpecialistIntent;
   verificationSpecialist?: "security-reviewer";
 }
+export type VerificationKind = "focused-tests" | "broader-tests" | "typecheck" | "lint" | "build" | "integration" | "independent-review" | "security-review";
+export interface RepoCheck { kind: Exclude<VerificationKind, "independent-review" | "security-review">; command: string; source: string; }
+export interface VerificationRequirement { kind: VerificationKind; reason: string; command?: string; }
+export interface VerificationPlan { requirements: VerificationRequirement[]; }
 export interface Task {
   id: string; title: string; objective: string; goal: string; dependencies: string[];
   acceptance: string[]; affectedDomains: string[]; affectedFiles: string[];
@@ -20,7 +24,7 @@ export interface Task {
   classificationSignals: string[]; classificationRationale: string[];
   parallelEligible: boolean; executionRoute: "direct" | "investigate" | "decompose";
   execution: TaskExecution;
-  verificationRequirements: string[]; verificationCommands: string[];
+  verificationRequirements: string[]; verificationCommands: string[]; verificationPlan: VerificationPlan;
   status: TaskStatus; attempts: number; lastError?: string;
 }
 export interface Slice { id: string; title: string; status: "pending" | "active" | "complete"; tasks: Task[]; }
@@ -45,6 +49,7 @@ export type InboxMessage =
 export interface ShipState {
   schemaVersion: 1; projectName: string; phase: RunPhase; roadmapRevision: number;
   milestones: Milestone[]; current?: { milestoneId: string; sliceId: string; taskId?: string };
+  repoChecks?: RepoCheck[];
   paused: boolean; blockedReason?: string; lastProgressAt: string; createdAt: string; updatedAt: string;
   workspace?: { path: string; branch: string; baseHead: string };
   lastHead?: string; partialTree?: string; activeAttempt?: Attempt; dispatches?: number; planningFailures?: number;

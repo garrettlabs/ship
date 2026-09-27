@@ -1,7 +1,8 @@
-import type { Milestone, Review, RoadmapEdit, ShipState, Task, TaskType, TaskUncertainty } from "./types.ts";
+import type { Milestone, RepoCheck, Review, RoadmapEdit, ShipState, Task, TaskType, TaskUncertainty } from "./types.ts";
 import { classifyTask } from "./task-classification.ts";
 import { routeTask } from "./role-router.ts";
 import { DependencyGraph } from "./dependency-graph.ts";
+import { routeVerification } from "./verification.ts";
 
 function object(x: unknown): asserts x is Record<string, unknown> {
   if (!x || typeof x !== "object" || Array.isArray(x)) throw new Error("Expected an object");
@@ -18,10 +19,10 @@ const taskTypes: TaskType[] = ["reconnaissance", "planning-design", "implementat
 const uncertainties: TaskUncertainty[] = ["LOW", "MEDIUM", "HIGH", "UNKNOWN"];
 const statuses = ["pending", "running", "verifying", "passed", "failed", "blocked"];
 function optionalStrings(x: unknown, name: string): asserts x is string[] | undefined { if (x !== undefined) strings(x, name); }
-function taskMetadata(task: Record<string, unknown>, fromPlan: boolean): Task {
+function taskMetadata(task: Record<string, unknown>, fromPlan: boolean, repoChecks: readonly RepoCheck[] = []): Task {
   object(task); id(task.id, "T"); text(task.title, "task title"); text(task.goal, "goal");
   strings(task.acceptance, "acceptance", true); strings(task.verificationCommands, "verificationCommands", true);
-  if (fromPlan && ["status", "attempts", "lastError", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute", "execution"].some(key => key in task)) throw new Error("Planner cannot override task lifecycle or classification");
+  if (fromPlan && ["status", "attempts", "lastError", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute", "execution", "verificationPlan"].some(key => key in task)) throw new Error("Planner cannot override task lifecycle or classification");
   if (task.objective !== undefined) text(task.objective, "objective");
   optionalStrings(task.dependencies, "dependencies"); optionalStrings(task.affectedDomains, "affectedDomains");
   optionalStrings(task.affectedFiles, "affectedFiles"); optionalStrings(task.verificationRequirements, "verificationRequirements");
@@ -44,6 +45,7 @@ function taskMetadata(task: Record<string, unknown>, fromPlan: boolean): Task {
     classificationSignals: classification.signals, classificationRationale: classification.rationale,
     parallelEligible: classification.parallelEligible, executionRoute: classification.executionRoute,
     execution: routeTask({ ...normalized, complexity: classification.complexity, risk: classification.risk }),
+    verificationPlan: routeVerification({ ...normalized, complexity: classification.complexity, risk: classification.risk }, repoChecks),
   };
   for (const key of Object.keys(computed) as (keyof typeof computed)[]) {
     if (!fromPlan && task[key] !== undefined && JSON.stringify(task[key]) !== JSON.stringify(computed[key])) throw new Error(`Invalid persisted ${key}`);
@@ -51,7 +53,7 @@ function taskMetadata(task: Record<string, unknown>, fromPlan: boolean): Task {
   return { ...normalized, ...computed };
 }
 
-export function normalizePlan(value: unknown, fromPlan = false): Milestone[] {
+export function normalizePlan(value: unknown, fromPlan = false, repoChecks: readonly RepoCheck[] = []): Milestone[] {
   if (!Array.isArray(value)) throw new Error("Expected milestones");
   const normalized = value.map(m => {
     object(m);
@@ -63,7 +65,7 @@ export function normalizePlan(value: unknown, fromPlan = false): Milestone[] {
       if (!Array.isArray(s.tasks)) throw new Error("Slice needs tasks");
       return { ...s, status: fromPlan ? "pending" : s.status, tasks: s.tasks.map(t => {
         object(t);
-        return taskMetadata(t, fromPlan);
+        return taskMetadata(t, fromPlan, repoChecks);
       }) };
     }) };
   }) as Milestone[];
@@ -102,9 +104,9 @@ export function validatePlan(value: unknown): asserts value is Milestone[] {
   unique(value);
   new DependencyGraph(value);
 }
-export function parsePlan(output: string): Milestone[] {
+export function parsePlan(output: string, repoChecks: readonly RepoCheck[] = []): Milestone[] {
   const raw: unknown = JSON.parse(output.trim()); object(raw);
-  return normalizePlan(raw.milestones, true);
+  return normalizePlan(raw.milestones, true, repoChecks);
 }
 export function tasks(state: ShipState) {
   return state.milestones.flatMap(m => m.slices.flatMap(s => s.tasks.map(t => ({ m, s, t, key: `${m.id}/${s.id}/${t.id}`, slice: `${m.id}/${s.id}` }))));
@@ -121,13 +123,13 @@ export function applyRoadmapEdit(state: ShipState, edit: RoadmapEdit): void {
     if (!slice) throw new Error(`Unknown slice: ${edit.slice}`);
     const next = Math.max(0, ...slice.tasks.map(t => Number(t.id.slice(1)))) + 1;
     if (!Number.isSafeInteger(next)) throw new Error("Task ID limit exceeded");
-    slice.tasks.push(taskMetadata({ id: `T${String(next).padStart(2, "0")}`, title: edit.title, goal: edit.goal, acceptance: [edit.acceptance], verificationCommands: [edit.check] }, true));
+    slice.tasks.push(taskMetadata({ id: `T${String(next).padStart(2, "0")}`, title: edit.title, goal: edit.goal, acceptance: [edit.acceptance], verificationCommands: [edit.check] }, true, state.repoChecks));
     const added = slice.tasks[slice.tasks.length - 1]; added.status = "pending"; added.attempts = 0;
   } else {
     const entry = plan.flatMap(m => m.slices.flatMap(s => s.tasks.map(t => ({ key: `${m.id}/${s.id}/${t.id}`, t })))).find(x => x.key === edit.task);
     if (!entry) throw new Error(`Unknown task: ${edit.task}`);
     if (entry.t.status !== "pending" || entry.t.attempts !== 0) throw new Error(`Task ${edit.task} has already started`);
-    Object.assign(entry.t, taskMetadata({ ...entry.t, goal: edit.goal, complexity: undefined, risk: undefined, classificationSignals: undefined, classificationRationale: undefined, parallelEligible: undefined, executionRoute: undefined, execution: undefined }, false));
+    Object.assign(entry.t, taskMetadata({ ...entry.t, goal: edit.goal, complexity: undefined, risk: undefined, classificationSignals: undefined, classificationRationale: undefined, parallelEligible: undefined, executionRoute: undefined, execution: undefined, verificationPlan: undefined }, false, state.repoChecks));
   }
   validatePlan(plan);
   state.milestones = plan;
@@ -163,7 +165,7 @@ export function applyReview(state: ShipState, output: string, source: string): R
   const review = raw as unknown as Review;
   for (const change of review.changes) {
     const task = tasks(state).find(t => t.key === change.task)!.t;
-    Object.assign(task, taskMetadata({ ...task, goal: change.goal, complexity: undefined, risk: undefined, classificationSignals: undefined, classificationRationale: undefined, parallelEligible: undefined, executionRoute: undefined, execution: undefined }, false));
+    Object.assign(task, taskMetadata({ ...task, goal: change.goal, complexity: undefined, risk: undefined, classificationSignals: undefined, classificationRationale: undefined, parallelEligible: undefined, executionRoute: undefined, execution: undefined, verificationPlan: undefined }, false, state.repoChecks));
   }
   state.knowledge ??= [];
   for (const lesson of review.lessons) state.knowledge.push({ ...lesson, id: `K${String(state.knowledge.length + 1).padStart(4, "0")}`, source: "agent", evidence: `${source}: ${lesson.evidence}`, at: new Date().toISOString() });

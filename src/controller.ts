@@ -9,6 +9,7 @@ import { applyReview, parsePlan, refresh, tasks } from "./model.ts";
 import { DependencyGraph } from "./dependency-graph.ts";
 import { acquireLock } from "./lock.ts";
 import { assertNoProcess, runCheck } from "./process.ts";
+import { discoverRepoChecks, missingVerification } from "./verification.ts";
 
 export type Step = "progress" | "task" | "complete" | "blocked" | "paused";
 export interface ControllerOptions { signal?: AbortSignal; fault?: (at: "after_execute" | "after_verify" | "after_commit") => void; }
@@ -72,7 +73,8 @@ export class Controller {
       if (await head(cwd) !== s.workspace!.baseHead || await candidateTree(cwd) !== baseline) return this.block(s, "Planner modified source; changes preserved for inspection");
       try {
         if (!result.ok) throw new Error(result.error ?? "Planner failed");
-        s.milestones = parsePlan(result.text);
+        s.repoChecks = await discoverRepoChecks(cwd);
+        s.milestones = parsePlan(result.text, s.repoChecks);
       } catch (error) {
         s.phase = "idle";
         await this.persist(s, "planning_failed", { error: String(error) });
@@ -125,7 +127,7 @@ export class Controller {
     if (t.attempts >= config.limits.maxTaskAttempts) return this.block(s, `${key} exhausted its persistent repair budget`);
     t.attempts++; t.status = "running"; s.phase = "executing";
     s.current = { milestoneId: m.id, sliceId: slice.id, taskId: t.id };
-    s.activeAttempt = { id: `${key.replaceAll("/", "-")}-a${t.attempts}`, key, baseHead: await head(cwd), stage: "executing", commands: [...(config.protectedChecks ?? []), ...t.verificationCommands], revision: s.roadmapRevision };
+    s.activeAttempt = { id: `${key.replaceAll("/", "-")}-a${t.attempts}`, key, baseHead: await head(cwd), stage: "executing", commands: [...new Set([...(config.protectedChecks ?? []), ...t.verificationPlan.requirements.flatMap(r => r.command ? [r.command] : [])])], revision: s.roadmapRevision };
     await this.persist(s, "task_started", { task: key, attempt: t.attempts });
     const result = await this.invoke(s, executorPrompt(project, s, t), cwd, s.activeAttempt.id);
     if (await head(cwd) !== s.activeAttempt.baseHead) return this.block(s, "Executor committed unexpectedly; preserving work for reconciliation");
@@ -179,6 +181,9 @@ export class Controller {
       }
     }
     if (!checks.length || await head(cwd) !== a.baseHead || await candidateTree(cwd) !== a.tree) return this.block(s, "Verification changed source, changed HEAD, or ran no checks");
+    const plan = tasks(s).find(entry => entry.key === a.key)!.t.verificationPlan;
+    const missing = missingVerification(plan, checks);
+    if (missing.length) return this.block(s, `Required verification has no successful evidence: ${missing.join("; ")}`);
     await atomicJson(path.join(shipDir(this.root), "attempts", `${a.id}.verification.json`), { tree: a.tree, baseHead: a.baseHead, revision: a.revision, checks, passed: true });
     a.stage = "committing"; await saveState(this.root, s);
     this.options.fault?.("after_verify");
@@ -188,6 +193,8 @@ export class Controller {
     const a = s.activeAttempt!;
     const evidence = await readJson<{ passed: boolean; tree: string; baseHead: string; revision: number; checks: { command: string; ok: boolean }[] }>(path.join(shipDir(this.root), "attempts", `${a.id}.verification.json`));
     if (!a.tree || !evidence.passed || evidence.tree !== a.tree || evidence.baseHead !== a.baseHead || evidence.revision !== a.revision || JSON.stringify(evidence.checks.map(c => c.command)) !== JSON.stringify(a.commands) || evidence.checks.some(c => !c.ok)) return this.block(s, "Verification evidence does not match commit intent");
+    const missing = missingVerification(tasks(s).find(entry => entry.key === a.key)!.t.verificationPlan, evidence.checks);
+    if (missing.length) return this.block(s, `Required verification has no successful evidence: ${missing.join("; ")}`);
     let commit = await head(cwd);
     if (commit === a.baseHead) commit = await commitCandidate(cwd, a.tree, a.baseHead, a.id);
     else if (!await matchesCommit(cwd, commit, a.tree, a.baseHead, a.id)) return this.block(s, "Commit recovery found unrelated history");
