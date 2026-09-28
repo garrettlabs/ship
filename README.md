@@ -1,33 +1,83 @@
 # SHIP
 
-SHIP adds persistent planning, dependency scheduling, role routing, and verification policy to an [oh-my-pi (OMP)](https://github.com/can1357/oh-my-pi) coding session. It is an **OMP extension**, not a separate agent runner. OMP owns the models, sessions, coding agents, tools, and your checkout; SHIP stores the roadmap and progress in that checkout, decides which work is ready, and checks reported results. There is no production `ship` CLI, detached SHIP worker, separate worktree, or SHIP terminal UI.
+SHIP adds persistent planning and verified progress to an [oh-my-pi (OMP)](https://github.com/can1357/oh-my-pi) coding session. It is an **OMP extension**, not a separate agent runner. OMP owns the models, sessions, coding agents and tools; SHIP stores the roadmap in your checkout, schedules ready work and checks reported results.
 
-## Install and make a first request
+## Why SHIP?
 
-You need Node.js 22.6+, Git, and an installed, authenticated OMP. Shell verification also needs `sh` on PATH; on Windows it additionally needs PowerShell for process containment (Git for Windows supplies `sh`). From a local SHIP checkout:
+Use SHIP for multi-step changes where tasks depend on each other and progress must survive across sessions. It records prerequisites, routes work to OMP agents, and requires checks and reviews before marking tasks passed. For a small one-off edit that does not need a persistent roadmap, an ordinary OMP request may be simpler.
+
+There is no separate SHIP CLI, detached worker or terminal UI. Persistent state does not mean unattended execution: you advance work from an OMP session.
+
+## Install
+
+1. Install Node.js 22.6+ and Git.
+2. Follow the [OMP installation guide](https://github.com/can1357/oh-my-pi#install) and [provider authentication guide](https://github.com/can1357/oh-my-pi/blob/main/docs/providers.md). Confirm OMP can answer an ordinary request with your chosen model before adding SHIP. Installing SHIP's dependencies does not configure OMP authentication.
+3. Make `sh` available on PATH for verification commands. On Windows, also make PowerShell available; Git for Windows supplies `sh`.
+
+Install SHIP from a local checkout:
 
 ```bash
-cd /path/to/Ship
+git clone https://github.com/garrettlabs/ship.git Ship
+cd Ship
 npm ci
-omp plugin link /path/to/Ship
+omp plugin link "/path/to/Ship"
 ```
 
-`omp plugin install /path/to/Ship` also links a local checkout. Once published, `omp plugin install ship-autopilot` installs the package. For an unregistered development checkout, load the extension directly instead:
+Replace `/path/to/Ship` with the absolute path of the checkout you just cloned; quote paths containing spaces. The link uses that checkout, so keep it in place. Start a new interactive OMP session in the **project you want to change**, not the SHIP checkout:
 
 ```bash
-omp --extension /path/to/Ship/extensions/ship.ts --cwd /path/to/your-repo
+omp --cwd "/path/to/your-repo"
 ```
 
-The package's OMP extension entry is `extensions/ship.ts`. Start OMP in an existing project repository with the plugin enabled (or use the direct-load command above), then ask for a concrete, checkable change:
+Alternatively, skip `omp plugin link` and load the extension directly:
 
-```text
-/ship add "Add a password-reset request endpoint; follow this repo's API conventions and run its declared checks"
-/ship status
+```bash
+omp --extension "/path/to/Ship/extensions/ship.ts" --cwd "/path/to/your-repo"
 ```
 
-On first use, `/ship add "request"` and `/ship change "request"` adopt the current Git checkout, discover its instructions and declared checks, create minimal `.ship/` state, and ask the OMP-native planner for a roadmap. They do not require an initialization wizard or rearrange the project. Without inline request text, SHIP prompts once. `/ship change` is the natural first request when changing existing behavior. The planner inspects the project and submits a validated plan; planning itself is not permission to modify source files. If work has not advanced, use `/ship run` to explicitly resume planning or dispatch. OMP does not autonomously start SHIP's scheduler in the background.
+### OMP models and roles
 
-### What commands do
+SHIP uses OMP's existing authentication, models and task agents; there is no separate SHIP provider configuration. First-use planning requires OMP's `task` agent. Ordinary implementation also uses `task`; bounded lightweight work can use the `smol` route and `sonic` agent, while some small tasks can run in the main session. Ensure those OMP agents are available and can use an authenticated model. Agent names and model-role aliases are different settings.
+
+Design and demanding implementation/review routes use `@plan` and `@slow`. Those routes are blocked if the selected role cannot resolve to a model.
+
+Before using those routes, configure the roles through OMP's model/role settings with models you can access. See [OMP settings](https://github.com/can1357/oh-my-pi/blob/main/docs/settings.md) for `modelRoles` and [task-agent discovery](https://github.com/can1357/oh-my-pi/blob/main/docs/task-agent-discovery.md) for agent configuration. A working main-session model alone does not guarantee every selected role is available. Jev is optional and is not needed for the first run.
+
+## Complete your first run
+
+Start with a small change in an existing Git repository whose dependencies and checks already work. A disposable repository is a good place to learn the workflow.
+
+**Agents can modify your checkout with your normal filesystem permissions; they are not sandboxes. Model calls may incur provider charges.** Planning itself is not permission to edit source, but this workflow proceeds to execution; it is not a plan-preview-only mode.
+
+1. **Request a bounded change.** In the interactive OMP session, enter:
+
+   ```text
+   /ship add "Add a test covering an existing public function's boundary case; follow this repo's conventions and run its declared test command"
+   ```
+
+   Choose a behavior you can check, and name the real verification command if the repository does not declare one. First-use `/ship add` or `/ship change` adopts the checkout, discovers guidance/checks, creates `.ship/` state and starts planning. No initialization wizard is required. Use `/ship change "request"` instead when changing existing behavior.
+
+2. **Inspect the plan and progress.** After the planner responds, enter:
+
+   ```text
+   /ship status
+   ```
+
+   Read `.ship/EXECUTION_PLAN.md` for task goals, dependencies, ownership, routes and verification requirements. Check `.ship/project-profile.json` if expected repository guidance or checks are missing. SHIP does not guess undiscovered commands.
+
+3. **Advance work in the same session.** If planning or dispatch has not advanced, enter:
+
+   ```text
+   /ship run
+   ```
+
+   Review the confirmation prompt. OMP performs ready assignments and reports their outcomes; SHIP runs applicable checks and requires any necessary independent reviews. Use `/ship status` to inspect progress and `/ship run` when another explicit advance is needed. There is no background scheduler. If blocked, resolve the reported cause using [Troubleshooting](#troubleshooting), rather than repeatedly dispatching.
+
+4. **Check completion, not just the agent's reply.** Run `/ship status` again. Inspect the generated roadmap for task states and `.ship/attempts/` for verification evidence. A task is `passed` only after its required checks and reviews pass; the project reaches `complete` only after all tasks and any configured integration checks pass. Review the resulting source diff yourself.
+
+Saved progress remains in the project when you reopen OMP. A new session can inspect status, but cannot silently take over outstanding assignments; see [Recovery](#recovery-and-safety-limits).
+
+## Command reference
 
 | Command | When to use it |
 | --- | --- |
@@ -49,6 +99,26 @@ Submitting the form only queues an edit. `/ship run` applies queued edits at a s
 | **Applied** | After `/ship run` reaches a safe boundary, the roadmap revision and generated roadmap/plan views reflect the accepted edit. |
 | **Blocked** | `/ship status` reports `blocked` and a reason (such as a stale revision, overlapping user work, or failed checks); resolve the cause before `/ship resume` and `/ship run`. |
 | **Verified** | Task state is `passed` only after its required checks and reviews pass; inspect `.ship/attempts/` for check evidence. `complete` additionally requires any configured project integration checks. An agent's `passed` report alone is not proof. |
+
+## Troubleshooting
+
+Start with `/ship status`; use its reason and `.ship/attempts/` or `.ship/events.jsonl` to identify the cause.
+
+| Symptom | Action |
+| --- | --- |
+| `/ship` is missing | Link the checkout and start a new OMP session, or use the direct-load command under [Install](#install). |
+| Provider authentication fails | Fix authentication in OMP using its [provider guide](https://github.com/can1357/oh-my-pi/blob/main/docs/providers.md); SHIP has no separate model credentials. |
+| An OMP task agent is missing or cannot start | Check OMP's [agent discovery](https://github.com/can1357/oh-my-pi/blob/main/docs/task-agent-discovery.md) and model authentication. Initial planning needs `task`; lightweight work may use `sonic`. |
+| `@plan` or `@slow` is unavailable | Configure that role in OMP with an accessible model, then retry in the owning session. |
+| Planning or work is not advancing | Use `/ship run` in the session that owns the work. Status is observational; SHIP has no background scheduler. |
+| Dirty-file ownership or a branch change blocks work | Review the planned ownership and existing changes. Preserve user work and resolve the conflict before resuming; do not delete changes to bypass the guard. |
+| An edit is rejected as stale or unsafe | Inspect the current roadmap and rejection reason, then submit a corrected edit against the current revision. A queued request is not an applied change. |
+| A check fails or cannot execute | Inspect its evidence, fix the underlying failure or missing dependency, and ensure `sh` (plus PowerShell on Windows) is on PATH. Failed checks cannot count as success. |
+| Dispatch budget is exhausted | Review the cost/work remaining, then raise `limits.maxDispatches` in `.ship/config.json` if appropriate. Use `/ship resume`, then `/ship run`; reviewers also consume dispatches. |
+| Another session owns outstanding work | Return to that session. If it and all its workers have stopped, follow [Recovery](#recovery-and-safety-limits); do not recover while they may still write. |
+| `.ship/` exists but state is invalid | Inspect or archive the state before attempting a fresh initialization. Do not blindly delete it or assume automatic migration. |
+
+After resolving a blocked phase's cause, use `/ship resume` and `/ship run`. These commands do not waive ownership, verification or budget requirements.
 
 ## How a run progresses
 
@@ -99,9 +169,7 @@ SHIP asks the **main OMP session** to call the public `jev_ask` tool with bounde
 
 A pending judgment holds dispatch and queued roadmap edits. If the invocation never returns, use `/ship run` after `timeoutMs` to expire it. Disabling Jev affects future undecided routes, not running assignments. Persisted routing decisions and optional normalized semantic judgments contain no credentials or full Jev prompts.
 
-**Jev remains experimental, not the default recommendation.** From a development checkout, run `node --no-warnings --experimental-strip-types scripts/benchmark-judgment.ts --out <temporary-prefix>` for the deterministic baseline. Default unavailable mode measures fallbacks; `--simulate` exercises comparison machinery, **not Jev quality**. After calling the public `jev_ask` tool with working credentials, `--capture <public-tool-results.json>` compares recorded typed results and reports only available latency/usage/cost metrics.
-
-In an unconfigured ten-fixture run, six were Jev-eligible and all six fell back, with zero measured Jev calls; synthetic choices differed on six roles and escalated three. A separate OMP RPC smoke with the Jev extension but no `TYPESAFE_API_KEY` saw a public-tool error in 26 ms, deterministic error fallback, and a passing repository check; disabling judgment made no Jev call. Neither run measures successful-call latency, usage, cost or decision quality.
+**Jev remains experimental, not the default recommendation.** Fallback and simulated runs do not establish successful-call quality, latency or cost.
 
 ## Recovery and safety limits
 

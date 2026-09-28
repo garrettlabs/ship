@@ -1,5 +1,4 @@
-.ship/logs/
-.ship/lock
-.ship/worktree/
+.ship/
+.omp/
 node_modules/
 .DS_Store
