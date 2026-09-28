@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import { parsePlan, applyRoadmapEdit } from "../src/model.ts";
 import { atomicJson, loadState, saveState, statePath } from "../src/store.ts";
 import { fixture, plan } from "./helpers.ts";
@@ -113,7 +113,7 @@ test("legacy plan metadata is honest about unknown scope and planner cannot over
   assert.equal(legacy.objective, legacy.goal); assert.equal(legacy.uncertainty, "UNKNOWN");
   assert.equal(legacy.risk, "UNKNOWN"); assert.equal(legacy.executionRoute, "investigate");
   assert.deepEqual(legacy.verificationRequirements, legacy.acceptance);
-  for (const extra of [{ status: "passed" }, { attempts: 99 }, { risk: "LOW" }, { execution: { mode: "main", role: "main", reason: "override" } }]) {
+  for (const extra of [{ status: "passed" }, { attempts: 99 }, { risk: "LOW" }, { evidenceRefs: ["fake proof"] }, { supersededBy: ["M001/S01/T02"] }, { execution: { mode: "main", role: "main", reason: "override" } }]) {
     const raw = JSON.parse(plan()); Object.assign(raw.milestones[0].slices[0].tasks[0], extra);
     assert.throws(() => parsePlan(JSON.stringify(raw)), /Planner cannot override/);
   }
@@ -123,18 +123,27 @@ test("legacy plan metadata is honest about unknown scope and planner cannot over
   }
 });
 
-test("legacy state normalization preserves active attempt and commits only on save", async t => {
+test("v1 migration backs up atomically, preserves active attempt and recomputes policy fields", async t => {
   const root = await fixture(t);
   const state = await loadState(root); state.milestones = parsePlan(plan()); state.roadmapRevision = 7;
   const existing = state.milestones[0].slices[0].tasks[0]; existing.status = "verifying"; existing.attempts = 3;
   state.activeAttempt = { id: "attempt-3", key: "M001/S01/T01", baseHead: "base", stage: "verifying", commands: ["frozen check"], revision: 6, tree: "tree" };
   const legacy = structuredClone(state);
+  Object.assign(legacy, { schemaVersion: 1 });
   const old = legacy.milestones[0].slices[0].tasks[0] as unknown as Record<string, unknown>;
   for (const key of ["objective", "dependencies", "dependencyLevel", "affectedDomains", "affectedFiles", "taskType", "uncertainty", "verificationRequirements", "verificationPlan", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute", "execution"]) delete old[key];
+  await unlink(`${statePath(root)}.v1.backup`).catch(() => {});
   await atomicJson(statePath(root), legacy);
   const before = await readFile(statePath(root), "utf8");
-  const migrated = await loadState(root);
+  const observed = await loadState(root, { readOnly: true });
+  assert.equal(observed.schemaVersion, 2);
   assert.equal(await readFile(statePath(root), "utf8"), before);
+  await assert.rejects(readFile(`${statePath(root)}.v1.backup`, "utf8"), /ENOENT/);
+  const migrated = await loadState(root);
+  assert.equal(JSON.parse(await readFile(statePath(root), "utf8")).schemaVersion, 2);
+  assert.equal(await readFile(`${statePath(root)}.v1.backup`, "utf8"), before);
+  assert.equal((await loadState(root)).schemaVersion, 2);
+  assert.equal(await readFile(`${statePath(root)}.v1.backup`, "utf8"), before);
   assert.equal(migrated.roadmapRevision, 7); assert.deepEqual(migrated.activeAttempt, legacy.activeAttempt);
   assert.equal(migrated.milestones[0].slices[0].tasks[0].status, "verifying");
   assert.equal(migrated.milestones[0].slices[0].tasks[0].attempts, 3);
@@ -146,18 +155,15 @@ test("legacy state normalization preserves active attempt and commits only on sa
   const reloaded = await loadState(root);
   assert.deepEqual(reloaded.activeAttempt, legacy.activeAttempt);
   assert.deepEqual(reloaded.milestones[0].slices[0].tasks[0], migrated.milestones[0].slices[0].tasks[0]);
-  const tamperedRoute = structuredClone(reloaded); tamperedRoute.milestones[0].slices[0].tasks[0].execution.reason = "manual override";
-  await atomicJson(statePath(root), tamperedRoute);
-  await assert.rejects(loadState(root), /Invalid persisted execution/);
-  const corrupted = structuredClone(reloaded); corrupted.milestones[0].slices[0].tasks[0].risk = "LOW";
-  await atomicJson(statePath(root), corrupted);
-  await assert.rejects(loadState(root), /Invalid persisted risk/);
-  const tamperedVerification = structuredClone(reloaded); tamperedVerification.milestones[0].slices[0].tasks[0].verificationPlan.requirements[0].reason = "manual override";
-  await atomicJson(statePath(root), tamperedVerification);
-  await assert.rejects(loadState(root), /Invalid persisted verificationPlan/);
-  const tamperedLevel = structuredClone(reloaded); tamperedLevel.milestones[0].slices[0].tasks[0].dependencyLevel = 99;
-  await atomicJson(statePath(root), tamperedLevel);
-  await assert.rejects(loadState(root), /Invalid persisted dependencyLevel/);
+  const stalePolicy = structuredClone(reloaded); stalePolicy.milestones[0].slices[0].tasks[0].execution.reason = "old policy";
+  stalePolicy.milestones[0].slices[0].tasks[0].risk = "LOW";
+  stalePolicy.milestones[0].slices[0].tasks[0].verificationPlan.requirements[0].reason = "old policy";
+  stalePolicy.milestones[0].slices[0].tasks[0].dependencyLevel = 99;
+  await atomicJson(statePath(root), stalePolicy);
+  const recomputed = await loadState(root);
+  assert.deepEqual(recomputed.milestones[0].slices[0].tasks[0].execution, reloaded.milestones[0].slices[0].tasks[0].execution);
+  assert.deepEqual(recomputed.milestones[0].slices[0].tasks[0].verificationPlan, reloaded.milestones[0].slices[0].tasks[0].verificationPlan);
+  assert.equal(recomputed.milestones[0].slices[0].tasks[0].dependencyLevel, 0);
 });
 
 test("goal edits refresh the objective and classification without weakening acceptance or checks", async t => {

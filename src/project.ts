@@ -100,13 +100,13 @@ async function createProject(root: string, brief?: string, discovery?: ShipState
   if (brief !== undefined) await writeFile(path.join(shipDir(root), "PROJECT.md"), brief);
   const config: ShipConfig = {
     schemaVersion: 1,
-    limits: { maxTaskAttempts: 3, maxDispatches: 100 },
+    limits: { maxTaskAttempts: 3, maxDispatches: 100, maxParallelTasks: 2 },
     verificationTimeoutMs: 300000, protectedChecks: [], judgment: { enabled: false, confidenceThreshold: 0.7, timeoutMs: 20_000 },
   };
   const now = new Date().toISOString();
   const state: ShipState = {
-    schemaVersion: 1, projectName: path.basename(root), phase: "idle", roadmapRevision: 0,
-    milestones: [], paused: false, lastProgressAt: now, createdAt: now, updatedAt: now, ...(discovery ? { discovery } : {}),
+    schemaVersion: 2, projectName: path.basename(root), phase: "idle", roadmapRevision: 0,
+    milestones: [], autonomy: "supervised", paused: false, lastProgressAt: now, createdAt: now, updatedAt: now, ...(discovery ? { discovery } : {}),
   };
   await atomicJson(configPath(root), config);
   await saveState(root, state);

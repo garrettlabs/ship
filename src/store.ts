@@ -1,9 +1,10 @@
-import { mkdir, readFile, rename, open, access, appendFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, open, access, appendFile, readdir, unlink, writeFile, link } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { InboxMessage, RoadmapEdit, ShipConfig, ShipState } from "./types.ts";
 import { applyRoadmapEdit, normalizePlan, refresh, strings, tasks } from "./model.ts";
 import { DependencyGraph } from "./dependency-graph.ts";
+import { reconcileRunTarget } from "./run-target.ts";
 export const shipDir = (root: string) => path.join(root, ".ship");
 export const statePath = (root: string) => path.join(shipDir(root), "state.json");
 export const configPath = (root: string) => path.join(shipDir(root), "config.json");
@@ -31,6 +32,30 @@ function validateNativeState(s: ShipState): void {
   const count = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
   if (!["idle", "planning", "executing", "verifying", "reviewing", "blocked", "complete"].includes(s.phase)) invalid("phase");
   if (!count(s.roadmapRevision) || (s.dispatches !== undefined && !count(s.dispatches)) || (s.planningFailures !== undefined && !count(s.planningFailures))) invalid("counters");
+  if (s.autonomy !== undefined && !["supervised", "yolo"].includes(s.autonomy)) invalid("autonomy mode");
+  if (s.autonomySessionId !== undefined && !label(s.autonomySessionId)) invalid("autonomy session");
+  if (s.autonomy === "yolo" && !s.autonomySessionId) invalid("yolo session");
+  if (s.runTarget !== undefined) {
+    const target = s.runTarget;
+    if (!record(target) || !["task", "slice", "milestone", "all"].includes(target.scope as string) ||
+        !count(target.revision) || !Array.isArray(target.keys) ||
+        target.keys.some(key => !label(key) || !/^M[0-9]{2,}\/S[0-9]{2,}\/T[0-9]{2,}$/.test(key)) ||
+        new Set(target.keys).size !== target.keys.length ||
+        (target.id !== undefined && !label(target.id)) ||
+        (target.scope === "all" && target.id !== undefined) ||
+        (!target.keys.length && s.milestones.length === 0 && target.id !== undefined))
+      invalid("run target");
+  }
+  if (s.humanEvidenceSessionId !== undefined && !label(s.humanEvidenceSessionId)) invalid("human evidence session");
+  if (s.humanApprovals !== undefined) {
+    if (!record(s.humanApprovals)) invalid("human approvals");
+    for (const [key, approval] of Object.entries(s.humanApprovals)) {
+      if (!record(approval) || approval.source !== "main-session-ui" || !label(approval.sessionId) ||
+          !label(approval.taskId) || !count(approval.revision) || !label(approval.acceptanceFingerprint) ||
+          typeof approval.approved !== "boolean" ||
+          !tasks(s).some(entry => entry.key === key && entry.t.id === approval.taskId)) invalid("human approval");
+    }
+  }
   if (s.discovery !== undefined) {
     const d = s.discovery;
     if (!record(d) || !label(d.id) || !label(d.sessionId) ||
@@ -42,7 +67,12 @@ function validateNativeState(s: ShipState): void {
   }
   if (s.nativePlanning !== undefined) {
     const p = s.nativePlanning;
-    if (!record(p) || !label(p.id) || !label(p.sessionId) || !count(p.attempts) || s.nativeBatch || s.milestones.length || !["planning", "blocked", "idle"].includes(s.phase)) invalid("planning assignment");
+    if (!record(p) || !label(p.id) || !label(p.sessionId) || !count(p.attempts) ||
+        (p.request !== undefined && !label(p.request)) ||
+        (p.intent !== undefined && !["add", "change", "expand"].includes(p.intent)) ||
+        (p.targetRevision !== undefined && (!count(p.targetRevision) || p.targetRevision !== s.roadmapRevision)) ||
+        (s.milestones.length > 0 && (!label(p.request) || !p.intent || p.targetRevision !== s.roadmapRevision)) ||
+        s.nativeBatch || s.pendingJudgment || s.activeAttempt || !["planning", "blocked", "idle"].includes(s.phase)) invalid("planning assignment");
   }
   if (s.nativeBatch !== undefined) {
     const b = s.nativeBatch;
@@ -51,7 +81,7 @@ function validateNativeState(s: ShipState): void {
         (b.settling !== undefined && typeof b.settling !== "boolean") || (b.awaitingBudget !== undefined && typeof b.awaitingBudget !== "boolean") ||
         (b.awaitingBudget && (b.stage !== "reviewing" || b.settling || b.assignments.some(a => a?.status !== "pending"))) ||
         (b.settling && b.assignments.some(a => a?.status === "pending")) ||
-        !["executing", "verifying", "idle", "blocked"].includes(s.phase)) invalid("batch");
+        !["executing", "verifying", "reviewing", "idle", "blocked"].includes(s.phase)) invalid("batch");
     const known = new Map(tasks(s).map(item => [item.key, item.t]));
     const ids = new Set<string>(), keys = new Set<string>();
     for (const a of b.assignments) {
@@ -62,8 +92,18 @@ function validateNativeState(s: ShipState): void {
           (a.specialistDispatched !== undefined && typeof a.specialistDispatched !== "boolean") ||
           (a.reviewVerdict !== undefined && !["correct", "incorrect", "unknown"].includes(a.reviewVerdict)) ||
           (a.verifiedCommands !== undefined && (!Array.isArray(a.verifiedCommands) || a.verifiedCommands.some(command => !label(command)))) ||
-          !known.has(a.key) || !["running", "verifying"].includes(known.get(a.key)!.status) ||
-          (b.stage === "reviewing" && known.get(a.key)!.status !== "verifying")) invalid("batch assignment");
+          (a.evidence !== undefined && (!record(a.evidence) ||
+            (a.evidence.acceptanceFingerprint !== undefined && !label(a.evidence.acceptanceFingerprint)) ||
+            (a.evidence.commands !== undefined && (!Array.isArray(a.evidence.commands) || a.evidence.commands.some(c => !record(c) || !label(c.command) || typeof c.ok !== "boolean"))) ||
+            (a.evidence.reviews !== undefined && (!Array.isArray(a.evidence.reviews) || a.evidence.reviews.some(r => !record(r) || typeof r.kind !== "string" || !["security-review", "independent-review"].includes(r.kind) || typeof r.ok !== "boolean"))) ||
+            (a.evidence.research !== undefined && (!record(a.evidence.research) || !label(a.evidence.research.path) ||
+              !label(a.evidence.research.fingerprint) || !label(a.evidence.research.acceptanceFingerprint) ||
+              !label(a.evidence.research.answer) || !Array.isArray(a.evidence.research.findings) ||
+              a.evidence.research.findings.some(f => !record(f) || !label(f.criterion) || !label(f.finding) || !label(f.support)))))) ||
+          !known.has(a.key) || !(b.settling && a.status !== "pending" && ["passed", "failed", "verifying"].includes(known.get(a.key)!.status)) &&
+            !["running", "verifying"].includes(known.get(a.key)!.status) ||
+          (b.stage === "reviewing" && known.get(a.key)!.status !== "verifying" &&
+            !(b.settling && a.status !== "pending" && ["passed", "failed"].includes(known.get(a.key)!.status)))) invalid("batch assignment");
       ids.add(a.id); keys.add(a.key);
     }
   }
@@ -78,9 +118,12 @@ function validateNativeState(s: ShipState): void {
   }
 }
 
-export async function loadState(root: string): Promise<ShipState> {
-  const s = await readJson<ShipState>(statePath(root));
-  if (!s || s.schemaVersion !== 1 || !Array.isArray(s.milestones) || typeof s.paused !== "boolean" || !Number.isInteger(s.roadmapRevision)) throw new Error("Invalid state.json");
+export async function loadState(root: string, options?: { readOnly?: boolean }): Promise<ShipState> {
+  const file = statePath(root);
+  const original = await readFile(file, "utf8");
+  const s = JSON.parse(original) as ShipState;
+  if (!s || ![1, 2].includes(Number(s.schemaVersion)) || !Array.isArray(s.milestones) || typeof s.paused !== "boolean" || !Number.isSafeInteger(s.roadmapRevision) || s.roadmapRevision < 0) throw new Error("Invalid state.json");
+  if (s.autonomy !== undefined && !["supervised", "yolo"].includes(s.autonomy)) throw new Error("Invalid autonomy");
   if (s.repoChecks !== undefined && (!Array.isArray(s.repoChecks) || s.repoChecks.some(c => !c || !["focused-tests", "broader-tests", "typecheck", "lint", "build", "integration"].includes(c.kind) || typeof c.command !== "string" || !c.command.trim() || typeof c.source !== "string" || !c.source.trim()))) throw new Error("Invalid persisted repo checks");
   if (s.ownedSnapshots !== undefined && (typeof s.ownedSnapshots !== "object" || s.ownedSnapshots === null ||
       Array.isArray(s.ownedSnapshots) || Object.entries(s.ownedSnapshots).some(([filename, hash]) =>
@@ -88,13 +131,40 @@ export async function loadState(root: string): Promise<ShipState> {
   if (s.milestones.length) s.milestones = normalizePlan(s.milestones, false, s.repoChecks);
   validateNativeState(s);
   s.knowledge ??= []; s.processedInbox ??= []; s.dispatches ??= 0; s.planningFailures ??= 0;
+  s.rejectedEdits ??= []; s.appliedEdits ??= []; s.proposalHistory ??= []; s.futureMilestones ??= []; s.autonomy ??= "supervised";
+  if (s.pendingProposal) {
+    const p = s.pendingProposal;
+    if (!p.id || !p.request?.trim() || !Number.isSafeInteger(p.targetRevision) || p.targetRevision !== s.roadmapRevision ||
+        p.status !== "pending" || (p.approvalBoundary !== undefined && !["routine", "explicit"].includes(p.approvalBoundary)) || !Array.isArray(p.impactedSummary) || !Array.isArray(p.milestones)) throw new Error("Invalid persisted roadmap proposal");
+    p.milestones = normalizePlan(p.milestones, false, s.repoChecks);
+  }
+  if (Number(s.schemaVersion) === 1) {
+    if (!options?.readOnly) {
+      const backup = `${file}.v1.backup`;
+      const temporary = `${backup}.${randomUUID()}.tmp`;
+      const handle = await open(temporary, "wx", 0o600);
+      try { await handle.writeFile(original); await handle.sync(); } finally { await handle.close(); }
+      try {
+        try { await link(temporary, backup); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST" || await readFile(backup, "utf8") !== original) throw error;
+        }
+      } finally { await unlink(temporary).catch(() => {}); }
+      if (process.platform !== "win32") {
+        const dir = await open(path.dirname(file), "r");
+        try { await dir.sync(); } finally { await dir.close(); }
+      }
+      s.schemaVersion = 2;
+      await atomicJson(file, s);
+    } else s.schemaVersion = 2;
+  }
   return s;
 }
 export async function saveState(root: string, state: ShipState): Promise<void> { state.updatedAt = new Date().toISOString(); await atomicJson(statePath(root), state); }
 export async function loadConfig(root: string): Promise<ShipConfig> {
   const c = await readJson<ShipConfig>(configPath(root));
   if (c.schemaVersion !== 1 || !c.limits) throw new Error("Invalid config.json");
-  for (const n of [c.limits.maxTaskAttempts, c.limits.maxDispatches, c.verificationTimeoutMs ?? 300_000]) {
+  for (const n of [c.limits.maxTaskAttempts, c.limits.maxDispatches, c.limits.maxParallelTasks ?? 2, c.verificationTimeoutMs ?? 300_000]) {
     if (!Number.isSafeInteger(n) || n <= 0) throw new Error("Timeouts and limits must be positive integers");
   }
   if (c.judgment !== undefined) {
@@ -104,14 +174,16 @@ export async function loadConfig(root: string): Promise<ShipConfig> {
         (j.timeoutMs !== undefined && (!Number.isSafeInteger(j.timeoutMs) || j.timeoutMs < 1000 || j.timeoutMs > 120_000))) throw new Error("Invalid judgment configuration");
   }
   strings(c.protectedChecks ?? [], "protectedChecks");
+  c.limits.maxParallelTasks ??= 2;
   return c;
 }
 export async function appendEvent(root: string, event: Record<string, unknown>): Promise<void> {
   await appendFile(path.join(shipDir(root), "events.jsonl"), JSON.stringify({ at: new Date().toISOString(), ...event }) + "\n", "utf8");
 }
+let inboxSequence = 0;
 async function writeInbox(root: string, message: RoadmapEdit | { type: "pause" | "resume" } | { type: "capture"; note: string }): Promise<void> {
   if (!await exists(statePath(root))) throw new Error("Run ship init first");
-  const id = `${Date.now()}-${randomUUID()}`;
+  const id = `${Date.now()}-${String(++inboxSequence).padStart(8, "0")}-${randomUUID()}`;
   await atomicJson(path.join(shipDir(root), "inbox", `${id}.json`), { ...message, id, at: new Date().toISOString() });
 }
 export async function queueMessage(root: string, type: "pause" | "resume" | "capture", note?: string): Promise<void> {
@@ -122,36 +194,41 @@ export async function queueRoadmapEdit(root: string, edit: RoadmapEdit): Promise
   const state = await loadState(root);
   if (!state.milestones.length) throw new Error("Roadmap has not been loaded");
   if (!Number.isSafeInteger(edit.revision) || edit.revision < 0) throw new Error("Invalid roadmap revision");
-  if (edit.revision !== state.roadmapRevision) throw new Error(`Stale roadmap revision: requested ${edit.revision}, current ${state.roadmapRevision}`);
+  if (edit.revision > state.roadmapRevision) throw new Error(`Future roadmap revision: requested ${edit.revision}, current ${state.roadmapRevision}`);
   await writeInbox(root, edit);
 }
 export async function consumeInbox(root: string, state: ShipState): Promise<void> {
-  state.processedInbox ??= []; state.knowledge ??= [];
+  state.processedInbox ??= []; state.knowledge ??= []; state.rejectedEdits ??= []; state.appliedEdits ??= [];
   const dir = path.join(shipDir(root), "inbox"); await mkdir(dir, { recursive: true });
   for (const file of (await readdir(dir)).filter(x => x.endsWith(".json")).sort()) {
     if (state.processedInbox.includes(file)) continue;
     const msg = await readJson<InboxMessage>(path.join(dir, file));
     if (msg.type === "pause") state.paused = true;
     else if (msg.type === "resume") { state.paused = false; if (state.phase === "blocked") { state.phase = "idle"; delete state.blockedReason; } }
-    else if (msg.type === "capture" && typeof msg.note === "string" && msg.note.trim()) state.knowledge.push({ id: `K${String(state.knowledge.length + 1).padStart(4, "0")}`, kind: "capture", text: msg.note, source: "user", evidence: `inbox/${file}`, at: msg.at });
+    else if (msg.type === "capture" && typeof msg.note === "string" && msg.note.trim()) state.knowledge.push({ id: `K${String(Math.max(0, ...state.knowledge.map(k => Number(k.id.slice(1)) || 0)) + 1).padStart(4, "0")}`, kind: "capture", text: msg.note, source: "user", evidence: `inbox/${file}`, at: msg.at });
     else if (msg.type === "add" || msg.type === "change") {
-      if (state.activeAttempt || state.nativeBatch || state.nativePlanning || state.pendingJudgment) continue;
+      if (state.activeAttempt || state.nativeBatch || state.nativePlanning || state.pendingJudgment || state.pendingProposal) continue;
       try {
         const allowed = ["id", "type", "at", "goal", "revision", "taskType", "uncertainty", "profile", "dependencies", "affectedFiles", "affectedDomains", "verificationRequirements", ...(msg.type === "add" ? ["slice", "title", "acceptance", "check"] : ["task"])];
         if (Object.keys(msg).some(key => !allowed.includes(key))) throw new Error("Roadmap edit contains forbidden fields");
-        applyRoadmapEdit(state, msg);
+        const touched = msg.type === "add" ? [`slice:${msg.slice}`] : [`task:${msg.task}`];
+        if (!Number.isSafeInteger(msg.revision) || msg.revision < 0 || msg.revision > state.roadmapRevision) throw new Error("Invalid roadmap revision");
+        if (msg.revision < state.roadmapRevision) {
+          const applied = state.appliedEdits.filter(e => e.revision > msg.revision);
+          if (applied.length !== state.roadmapRevision - msg.revision) throw new Error("Stale roadmap revision without a complete edit history");
+          if (applied.some(e => e.touched.some(x => touched.includes(x)))) throw new Error("Conflicting same-base roadmap edit");
+        }
+        applyRoadmapEdit(state, { ...msg, revision: state.roadmapRevision });
+        state.appliedEdits.push({ id: msg.id, baseRevision: msg.revision, revision: state.roadmapRevision, touched });
         refresh(state);
+        if (state.runTarget) state.runTarget = reconcileRunTarget(state, state.runTarget);
       }
       catch (error) {
-        state.phase = "blocked";
-        state.blockedReason = `Rejected inbox/${file}: ${error instanceof Error ? error.message : String(error)}`;
-        state.processedInbox.push(file);
-        break;
+        state.rejectedEdits.push({ id: msg.id, revision: msg.revision, reason: error instanceof Error ? error.message : String(error), at: msg.at });
       }
     } else throw new Error(`Invalid inbox message: ${file}`);
     state.processedInbox.push(file);
   }
-  // State and applied/rejected IDs are committed together: replay cannot duplicate a mutation.
   await saveState(root, state);
   await writeRoadmapView(root, state);
 }

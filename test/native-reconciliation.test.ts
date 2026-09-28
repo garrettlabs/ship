@@ -1,0 +1,32 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
+import { fixture, plan } from "./helpers.ts";
+import { parsePlan } from "../src/model.ts";
+import { applyNativeReconciliation, previewNativeReconciliation } from "../src/native-reconciliation.ts";
+import { loadState, saveState } from "../src/store.ts";
+
+test("reviewed check replacement invalidates only affected passing work, retaining old evidence", async t => {
+  const root = await fixture(t);
+  const state = await loadState(root);
+  state.milestones = parsePlan(plan());
+  state.milestones[0].slices[0].tasks[0].status = "passed";
+  state.milestones[0].slices[0].tasks[0].attempts = 1;
+  state.milestones[0].slices[0].tasks[0].evidenceRefs = ["attempts/first.verification.json"];
+  state.phase = "complete";
+  state.repoChecks = [{ kind: "typecheck", command: "npm run typecheck", source: "package.json scripts.typecheck" }];
+  await saveState(root, state);
+  await writeFile(path.join(root, "package.json"), JSON.stringify({ scripts: { check: "tsc --noEmit" } }));
+  const preview = await previewNativeReconciliation(root);
+  assert.equal(preview.checks.changes[0].type, "replaced");
+  assert.deepEqual(preview.checks.affectedTaskKeys, ["M001/S01/T01"]);
+  const result = await applyNativeReconciliation(root, "main-session", preview, { kind: "checks" });
+  assert.match(result, /fresh verification/);
+  const updated = await loadState(root);
+  assert.equal(updated.phase, "idle");
+  assert.equal(updated.milestones[0].slices[0].tasks[0].status, "failed");
+  assert.equal(updated.milestones[0].slices[0].tasks[0].attempts, 1);
+  assert.deepEqual(updated.milestones[0].slices[0].tasks[0].evidenceRefs, ["attempts/first.verification.json"]);
+  assert.deepEqual(updated.repoChecks?.map(check => check.command), ["npm run check"]);
+});

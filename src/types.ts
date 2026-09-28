@@ -1,4 +1,6 @@
-export type TaskStatus = "pending" | "running" | "verifying" | "passed" | "failed" | "blocked";
+import type { MainSessionHumanApproval, TaskEvidence } from "./evidence.ts";
+import type { HandoffCheckpoint } from "./handoff.ts";
+export type TaskStatus = "pending" | "running" | "verifying" | "passed" | "failed" | "blocked" | "deferred" | "cancelled" | "superseded";
 export type RunPhase = "idle" | "planning" | "executing" | "verifying" | "reviewing" | "blocked" | "complete";
 export type TaskType = "reconnaissance" | "planning-design" | "implementation" | "bugfix" | "refactor" | "test" | "documentation" | "migration" | "integration" | "review" | "research" | "configuration" | "security-review";
 export type TaskComplexity = "TRIVIAL" | "STANDARD" | "COMPLEX";
@@ -38,7 +40,17 @@ export interface PendingJudgment {
   eligible: ExecutionRole[]; requestHash: string;
 }
 export type VerificationKind = "focused-tests" | "broader-tests" | "typecheck" | "lint" | "build" | "integration" | "independent-review" | "security-review";
-export interface RepoCheck { kind: Exclude<VerificationKind, "independent-review" | "security-review">; command: string; source: string; }
+export interface RepoCheck {
+  kind: Exclude<VerificationKind, "independent-review" | "security-review">;
+  command: string;
+  source: string;
+  /** Approved effective script body or Makefile target definition, retained for reconciliation previews. */
+  definition?: string;
+  /** Selected package manager (or make), including decisions made from lockfiles. */
+  runner?: string;
+  /** Hash of the executable definition; for make this covers the entire Makefile and its dependencies. */
+  fingerprint?: string;
+}
 export interface VerificationRequirement { kind: VerificationKind; reason: string; command?: string; }
 export interface VerificationPlan { requirements: VerificationRequirement[]; }
 export interface Task {
@@ -51,16 +63,24 @@ export interface Task {
   parallelEligible: boolean; executionRoute: "direct" | "investigate" | "decompose";
   execution: TaskExecution;
   verificationRequirements: string[]; verificationCommands: string[]; verificationPlan: VerificationPlan;
-  status: TaskStatus; attempts: number; lastError?: string;
+  status: TaskStatus; attempts: number; lastError?: string; evidenceRefs?: string[]; evidence?: TaskEvidence; supersededBy?: string[]; acceptanceRevision?: number;
 }
-export interface Slice { id: string; title: string; status: "pending" | "active" | "complete"; tasks: Task[]; }
+export interface Slice { id: string; title: string; status: "pending" | "active" | "complete" | "deferred" | "cancelled" | "superseded"; tasks: Task[]; }
 export interface Milestone {
-  id: string; title: string; outcome: string; status: "pending" | "active" | "complete"; slices: Slice[];
+  id: string; title: string; outcome: string; status: "pending" | "active" | "complete" | "deferred" | "cancelled" | "superseded"; slices: Slice[];
 }
 export interface Knowledge {
   id: string; kind: "capture" | "observation" | "decision" | "assumption" | "lesson";
   text: string; source: "user" | "agent"; evidence: string; at: string;
 }
+export interface FutureMilestone { id: string; title: string; outcome: string; approach?: string; }
+export interface RoadmapProposal {
+  id: string; request: string; sessionId?: string; targetRevision: number;
+  milestones: Milestone[]; futureMilestones?: FutureMilestone[];
+  impactedSummary: string[]; approvalBoundary: "routine" | "explicit"; status: "pending" | "approved" | "rejected";
+  reason?: string; createdAt: string;
+}
+export interface RejectedEdit { id: string; revision: number; reason: string; at: string; }
 export interface Attempt {
   id: string; key: string; baseHead: string; stage: "executing" | "verifying" | "committing";
   commands: string[]; revision: number; summary?: string; tree?: string;
@@ -78,21 +98,31 @@ export type InboxMessage =
   | { id: string; type: "capture"; note: string; at: string }
   | (RoadmapEdit & { id: string; at: string });
 export interface NativeAssignment {
-  id: string; key: string; status: "pending" | "passed" | "failed" | "partial"; summary?: string; routed?: boolean; specialistDispatched?: boolean; reviewVerdict?: "correct" | "incorrect" | "unknown"; verifiedCommands?: string[];
+  id: string; key: string; status: "pending" | "passed" | "failed" | "partial"; summary?: string; routed?: boolean; specialistDispatched?: boolean; reviewVerdict?: "correct" | "incorrect" | "unknown"; verifiedCommands?: string[]; evidence?: TaskEvidence;
 }
 export interface NativeBatch {
   id: string; sessionId: string; revision: number; stage: "executing" | "reviewing"; assignments: NativeAssignment[]; settling?: boolean; awaitingBudget?: boolean;
 }
-export interface NativePlanning { id: string; sessionId: string; attempts: number; }
+export interface NativePlanning { id: string; sessionId: string; attempts: number; request?: string; intent?: "add" | "change" | "expand"; targetRevision?: number; }
 export interface DiscoveryState {
   id: string;
   sessionId: string;
   status: "researching" | "cancelled" | "approved";
   goalSet?: boolean;
 }
+export interface RunTarget {
+  scope: "task" | "slice" | "milestone" | "all";
+  /** Full task/slice key, milestone ID, or undefined while the first roadmap awaits approval. */
+  id?: string;
+  revision: number;
+  /** Frozen membership; an empty array is only valid before initial roadmap approval. */
+  keys: string[];
+}
 export interface ShipState {
-  schemaVersion: 1; projectName: string; phase: RunPhase; roadmapRevision: number;
+  schemaVersion: 2; projectName: string; phase: RunPhase; roadmapRevision: number;
   milestones: Milestone[]; current?: { milestoneId: string; sliceId: string; taskId?: string };
+  runTarget?: RunTarget;
+  autonomy?: "supervised" | "yolo"; autonomySessionId?: string;
   repoChecks?: RepoCheck[];
   /** Git state observed before SHIP first planned work; never treats these paths as SHIP-owned. */
   preexistingWork?: { branch: string | null; paths: string[]; truncated?: boolean; unknown?: boolean };
@@ -105,11 +135,16 @@ export interface ShipState {
   nativePlanning?: NativePlanning;
   discovery?: DiscoveryState;
   pendingJudgment?: PendingJudgment;
-  knowledge?: Knowledge[]; processedInbox?: string[];
+  knowledge?: Knowledge[]; processedInbox?: string[]; rejectedEdits?: RejectedEdit[];
+  appliedEdits?: { id: string; baseRevision: number; revision: number; touched: string[] }[];
+  pendingProposal?: RoadmapProposal; proposalHistory?: RoadmapProposal[]; futureMilestones?: FutureMilestone[];
+  humanApprovals?: Record<string, MainSessionHumanApproval>;
+  humanEvidenceSessionId?: string;
+  handoff?: HandoffCheckpoint;
 }
 export interface ShipConfig {
   schemaVersion: 1;
-  limits: { maxTaskAttempts: number; maxDispatches: number };
+  limits: { maxTaskAttempts: number; maxDispatches: number; maxParallelTasks?: number };
   verificationTimeoutMs?: number; protectedChecks?: string[];
   judgment?: { enabled: boolean; confidenceThreshold?: number; timeoutMs?: number };
 }

@@ -1,8 +1,7 @@
 import type { Milestone, RepoCheck, RoadmapEdit, ShipState, Task, TaskType, TaskUncertainty } from "./types.ts";
 import { classifyTask } from "./task-classification.ts";
-import { routeTask } from "./role-router.ts";
 import { DependencyGraph } from "./dependency-graph.ts";
-import { applyDecision, derivedProfile, fallback, safeSemanticType, validateProfile, validateSemanticJudgment } from "./judgment.ts";
+import { applyDecision, derivedProfile, eligibleRoles, fallback, safeSemanticType, validateProfile, validateSemanticJudgment } from "./judgment.ts";
 import { routeVerification } from "./verification.ts";
 
 function object(x: unknown): asserts x is Record<string, unknown> {
@@ -18,15 +17,18 @@ function id(x: unknown, prefix: string) { if (typeof x !== "string" || !new RegE
 function unique(items: { id: string }[]) { if (new Set(items.map(x => x.id)).size !== items.length) throw new Error("Duplicate ID"); }
 const taskTypes: TaskType[] = ["reconnaissance", "planning-design", "implementation", "bugfix", "refactor", "test", "documentation", "migration", "integration", "review", "research", "configuration", "security-review"];
 const uncertainties: TaskUncertainty[] = ["LOW", "MEDIUM", "HIGH", "UNKNOWN"];
-const statuses = ["pending", "running", "verifying", "passed", "failed", "blocked"];
+const statuses = ["pending", "running", "verifying", "passed", "failed", "blocked", "deferred", "cancelled", "superseded"];
 function optionalStrings(x: unknown, name: string): asserts x is string[] | undefined { if (x !== undefined) strings(x, name); }
-function taskMetadata(task: Record<string, unknown>, fromPlan: boolean, repoChecks: readonly RepoCheck[] = []): Task {
+export function taskMetadata(task: Record<string, unknown>, fromPlan: boolean, repoChecks: readonly RepoCheck[] = []): Task {
   object(task); id(task.id, "T"); text(task.title, "task title"); text(task.goal, "goal");
-  strings(task.acceptance, "acceptance", true); strings(task.verificationCommands, "verificationCommands", true);
-  if (fromPlan && ["status", "attempts", "lastError", "complexity", "risk", "classificationSignals", "classificationRationale", "parallelEligible", "executionRoute", "execution", "routingDecision", "semanticJudgment", "effectiveTaskType", "effectiveUncertainty", "verificationPlan", "dependencyLevel"].some(key => key in task)) throw new Error("Planner cannot override task lifecycle or classification");
+  strings(task.acceptance, "acceptance", true); strings(task.verificationCommands, "verificationCommands");
+  if (fromPlan && Object.keys(task).some(key => !["id", "title", "objective", "goal", "acceptance", "verificationCommands", "dependencies", "affectedDomains", "affectedFiles", "verificationRequirements", "taskType", "uncertainty", "profile"].includes(key))) throw new Error("Planner cannot override task lifecycle or classification");
   if (task.objective !== undefined) text(task.objective, "objective");
   optionalStrings(task.dependencies, "dependencies"); optionalStrings(task.affectedDomains, "affectedDomains");
   optionalStrings(task.affectedFiles, "affectedFiles"); optionalStrings(task.verificationRequirements, "verificationRequirements");
+  optionalStrings(task.evidenceRefs, "evidenceRefs");
+  optionalStrings(task.supersededBy, "supersededBy");
+  if (task.acceptanceRevision !== undefined && (!Number.isSafeInteger(task.acceptanceRevision) || (task.acceptanceRevision as number) < 0)) throw new Error("Invalid acceptance revision");
   if (task.taskType !== undefined && !taskTypes.includes(task.taskType as TaskType)) throw new Error("Invalid taskType");
   if (task.uncertainty !== undefined && !uncertainties.includes(task.uncertainty as TaskUncertainty)) throw new Error("Invalid uncertainty");
   if (task.profile !== undefined && !validateProfile(task.profile)) throw new Error("Invalid task profile");
@@ -62,15 +64,19 @@ function taskMetadata(task: Record<string, unknown>, fromPlan: boolean, repoChec
   if (classification.complexity === "COMPLEX") classification.parallelEligible = false;
   if (classification.risk === "HIGH") classification.parallelEligible = false;
   if (classification.complexity === "COMPLEX" && classification.executionRoute === "direct") classification.executionRoute = "decompose";
-  const profile = task.profile ? { ...(task.profile as Task["profile"]), source: (task.profile as Task["profile"]).source ?? "planner" as const }
+  const profile = task.profile && (task.profile as Task["profile"]).source !== "derived"
+    ? { ...(task.profile as Task["profile"]), source: (task.profile as Task["profile"]).source ?? "planner" as const }
     : derivedProfile({ ...normalized, complexity: classification.complexity, risk: classification.risk }, classification.rationale, classification.signals);
-  const routingDecision = task.routingDecision === undefined ? fallback({ ...normalized, complexity: classification.complexity, risk: classification.risk, effectiveTaskType, effectiveUncertainty }, "disabled")
-    : task.routingDecision as Task["routingDecision"];
+  const classified = { ...normalized, taskType: effectiveTaskType, uncertainty: effectiveUncertainty, complexity: classification.complexity, risk: classification.risk, profile, effectiveTaskType };
+  const storedDecision = task.routingDecision as Task["routingDecision"] | undefined;
+  const reason = storedDecision?.backend === "omp-jev" ? "ineligible" :
+    storedDecision?.backend === "deterministic" && ["disabled", "unavailable", "unconfigured", "timeout", "error", "malformed", "low-confidence", "ineligible"].includes(storedDecision.reason ?? "")
+      ? storedDecision.reason! : "disabled";
+  const routingDecision = storedDecision?.backend === "omp-jev" && eligibleRoles(classified, [storedDecision.role]).includes(storedDecision.role) ? storedDecision
+    : fallback(classified, reason);
   if (!routingDecision || typeof routingDecision !== "object" || !["deterministic", "omp-jev"].includes(routingDecision.backend) ||
       typeof routingDecision.fallbackUsed !== "boolean" || (routingDecision.backend === "omp-jev" && routingDecision.fallbackUsed) ||
-      (routingDecision.backend === "deterministic" && (!routingDecision.fallbackUsed || routingDecision.role !== routeTask({ ...normalized, taskType: effectiveTaskType, uncertainty: effectiveUncertainty, complexity: classification.complexity, risk: classification.risk }).role)) ||
       (routingDecision.confidence !== undefined && (typeof routingDecision.confidence !== "number" || !Number.isFinite(routingDecision.confidence) || routingDecision.confidence < 0 || routingDecision.confidence > 1))) throw new Error("Invalid persisted routing decision");
-  const classified = { ...normalized, taskType: effectiveTaskType, uncertainty: effectiveUncertainty, complexity: classification.complexity, risk: classification.risk, profile, effectiveTaskType };
   const computed = {
     complexity: classification.complexity, risk: classification.risk,
     effectiveTaskType, effectiveUncertainty,
@@ -79,9 +85,6 @@ function taskMetadata(task: Record<string, unknown>, fromPlan: boolean, repoChec
     execution: applyDecision(classified, routingDecision),
     verificationPlan: routeVerification(classified, repoChecks),
   };
-  for (const key of Object.keys(computed) as (keyof typeof computed)[]) {
-    if (!fromPlan && task[key] !== undefined && JSON.stringify(task[key]) !== JSON.stringify(computed[key])) throw new Error(`Invalid persisted ${key}`);
-  }
   return { ...normalized, profile, routingDecision, ...computed };
 }
 
@@ -111,13 +114,17 @@ export function normalizePlan(value: unknown, fromPlan = false, repoChecks: read
   validatePlan(normalized);
   const graph = new DependencyGraph(normalized);
   graph.levels.forEach((level, index) => level.forEach(({ key, task }) => {
-    if (!fromPlan && task.dependencyLevel !== undefined && task.dependencyLevel !== index) throw new Error(`Invalid persisted dependencyLevel for ${key}`);
     task.dependencyLevel = index;
   }));
+  const knownTaskKeys = new Set(graph.order.map(node => node.key));
+  for (const { key, task } of graph.order) if (task.supersededBy &&
+    (task.status !== "superseded" || !task.supersededBy.length || new Set(task.supersededBy).size !== task.supersededBy.length ||
+      task.supersededBy.some(successor => successor === key || !knownTaskKeys.has(successor))))
+    throw new Error(`Invalid superseded task successors for ${key}`);
   if (!fromPlan) for (const m of normalized) {
-    if (!["pending", "active", "complete"].includes(m.status)) throw new Error("Invalid milestone status");
+    if (!["pending", "active", "complete", "deferred", "cancelled", "superseded"].includes(m.status)) throw new Error("Invalid milestone status");
     for (const s of m.slices) {
-      if (!["pending", "active", "complete"].includes(s.status)) throw new Error("Invalid slice status");
+      if (!["pending", "active", "complete", "deferred", "cancelled", "superseded"].includes(s.status)) throw new Error("Invalid slice status");
       for (const t of s.tasks) if (!statuses.includes(t.status) || !Number.isSafeInteger(t.attempts) || t.attempts < 0) throw new Error("Invalid task state");
     }
   }
@@ -135,7 +142,7 @@ export function validatePlan(value: unknown): asserts value is Milestone[] {
       if (!Array.isArray(s.tasks) || !s.tasks.length) throw new Error("Slice needs tasks");
       for (const t of s.tasks) {
         object(t); id(t.id, "T"); text(t.title, "task title"); text(t.goal, "goal"); text(t.objective, "objective");
-        strings(t.acceptance, "acceptance", true); strings(t.verificationCommands, "verificationCommands", true);
+        strings(t.acceptance, "acceptance", true); strings(t.verificationCommands, "verificationCommands");
         strings(t.dependencies, "dependencies"); strings(t.affectedDomains, "affectedDomains"); strings(t.affectedFiles, "affectedFiles"); strings(t.verificationRequirements, "verificationRequirements", true);
         if (!taskTypes.includes(t.taskType as TaskType) || !uncertainties.includes(t.uncertainty as TaskUncertainty)) throw new Error("Invalid task metadata");
         if (++tasks > 200) throw new Error("Plan exceeds 200 tasks; reduce scope");
@@ -205,7 +212,11 @@ export function applyRoadmapEdit(state: ShipState, edit: RoadmapEdit): void {
 }
 export function refresh(state: ShipState): void {
   for (const m of state.milestones) {
-    for (const s of m.slices) s.status = s.tasks.every(t => t.status === "passed") ? "complete" : s.tasks.some(t => t.attempts > 0) ? "active" : "pending";
+    for (const s of m.slices) {
+      if (["deferred", "cancelled", "superseded"].includes(s.status)) continue;
+      s.status = s.tasks.every(t => t.status === "passed") ? "complete" : s.tasks.some(t => t.attempts > 0) ? "active" : "pending";
+    }
+    if (["deferred", "cancelled", "superseded"].includes(m.status)) continue;
     m.status = m.slices.every(s => s.status === "complete") ? "complete" : m.slices.some(s => s.status !== "pending") ? "active" : "pending";
   }
 }

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { access, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import type { RepoCheck, Task, VerificationKind, VerificationPlan } from "./types.ts";
@@ -7,8 +8,12 @@ type Scope = Pick<Task, "taskType" | "complexity" | "risk" | "affectedDomains" |
 /** Discovery reads declared project checks; it never executes a script or guesses installed tools. */
 export async function discoverRepoChecks(root: string): Promise<RepoCheck[]> {
   const checks: RepoCheck[] = [];
-  const add = (kind: RepoCheck["kind"], command: string, source: string) => {
-    if (!checks.some(check => check.kind === kind && check.command === command)) checks.push({ kind, command, source });
+  const add = (kind: RepoCheck["kind"], command: string, source: string, definition?: string, runner?: string, effective?: string) => {
+    if (!checks.some(check => check.kind === kind && check.command === command)) {
+      checks.push({ kind, command, source, ...(definition === undefined ? {} : {
+        definition, runner, fingerprint: createHash("sha256").update(`${runner}\0${effective ?? definition}`).digest("hex"),
+      }) });
+    }
   };
   const file = async (name: string) => readFile(path.join(root, name), "utf8").catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return undefined;
@@ -33,9 +38,12 @@ export async function discoverRepoChecks(root: string): Promise<RepoCheck[]> {
     const scripts: unknown = metadata && typeof metadata === "object" && "scripts" in metadata ? metadata.scripts : undefined;
     if (scripts && typeof scripts === "object" && !Array.isArray(scripts)) {
       const defined = scripts as Record<string, unknown>;
+      const packageManager = metadata && typeof metadata === "object" && "packageManager" in metadata ? metadata.packageManager : undefined;
       const script = (kind: RepoCheck["kind"], ...names: string[]) => {
         const name = names.find(name => { const value = defined[name]; return typeof value === "string" && Boolean(value.trim()); });
-        if (name && scriptRunner) add(kind, `${scriptRunner} run ${name}`, `package.json scripts.${name}`);
+        if (name && scriptRunner) add(kind, `${scriptRunner} run ${name}`, `package.json scripts.${name}`,
+          JSON.stringify({ selectedScript: name, body: defined[name], scripts: defined, packageManager }, null, 2),
+          scriptRunner, JSON.stringify([defined, packageManager]));
       };
       script("focused-tests", "test:unit", "test:focused");
       script("broader-tests", "test", "test:all");
@@ -46,16 +54,27 @@ export async function discoverRepoChecks(root: string): Promise<RepoCheck[]> {
       script("integration", "test:integration", "integration", "test:e2e", "e2e");
     }
   }
-  const makefile = await file("Makefile") ?? await file("makefile");
-  if (makefile) {
-    const targets = new Set([...makefile.matchAll(/^([a-zA-Z][\w-]*):(?!=)/gm)].map(match => match[1]));
+  const makefileName = await file("Makefile") !== undefined ? "Makefile" : "makefile";
+  const makefile = await file(makefileName);
+  if (makefile && !/^\s*(?:-?include|sinclude)\s+/m.test(makefile)) {
+    const declarations = [...makefile.matchAll(/^([a-zA-Z][\w-]*):(?!=)[^\r\n]*(?:\r?\n|$)/gm)];
+    const targets = new Map<string, string>();
+    for (let index = 0; index < declarations.length; index++) {
+      const start = declarations[index].index;
+      const end = declarations[index + 1]?.index ?? makefile.length;
+      const lines = makefile.slice(start, end).split(/\r?\n/);
+      const recipe = [lines[0], ...lines.slice(1).filter(line => line.startsWith("\t"))].join("\n");
+      targets.set(declarations[index][1], recipe);
+    }
     for (const [kind, names] of [
       ["focused-tests", ["test-unit", "test-focused"]], ["broader-tests", ["test", "check"]],
       ["typecheck", ["typecheck", "type-check"]], ["lint", ["lint"]], ["build", ["build"]],
       ["integration", ["test-integration", "integration", "test-e2e"]],
     ] as const) {
       const target = names.find(name => targets.has(name));
-      if (target) add(kind, `make ${target}`, `Makefile target ${target}`);
+      if (target) add(kind, `make ${target}`, `${makefileName} target ${target}`,
+        `Selected target ${target}:\n${targets.get(target)}\n\nEffective ${makefileName} (including local dependencies):\n${makefile}`,
+        "make", makefile);
     }
   }
   if (await file("Cargo.toml")) {
@@ -106,9 +125,9 @@ export function routeVerification(task: Scope, checks: readonly RepoCheck[] = []
   const require = (kind: VerificationKind, reason: string, command?: string) => requirements.push({ kind, reason, ...(command ? { command } : {}) });
   for (const command of task.verificationCommands) require("focused-tests", "Task-specific acceptance check", command);
   const lightweight = task.complexity === "TRIVIAL" && task.risk === "LOW";
-  const integration = task.taskType === "integration" || task.affectedDomains.length > 1 || task.dependencies.length > 1;
-  const broad = task.complexity === "COMPLEX" || integration;
   const codeChange = !["documentation", "reconnaissance", "planning-design", "research", "review", "security-review"].includes(task.taskType);
+  const integration = codeChange && (task.taskType === "integration" || task.affectedDomains.length > 1 || task.dependencies.length > 1);
+  const broad = task.complexity === "COMPLEX" || integration;
   for (const check of checks) {
     if (lightweight && check.kind !== "focused-tests") continue;
     if (check.kind === "focused-tests" && !codeChange) continue;

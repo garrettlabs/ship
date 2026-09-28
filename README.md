@@ -1,191 +1,100 @@
 # SHIP
 
-SHIP adds persistent planning and verified progress to an [oh-my-pi (OMP)](https://github.com/can1357/oh-my-pi) coding session. It is an **OMP extension**, not a separate agent runner. OMP owns the models, sessions, coding agents and tools; SHIP stores the roadmap in your checkout, schedules ready work and checks reported results.
+SHIP is an [oh-my-pi (OMP)](https://github.com/can1357/oh-my-pi) extension for planning and verifying multi-step changes in an existing Git checkout. OMP owns the session, models, agents and tools. SHIP stores a versioned roadmap and evidence in `.ship/`. It does not run a detached worker, sandbox agents, push changes or publish releases.
 
-## Why SHIP?
-
-Use SHIP for multi-step changes where tasks depend on each other and progress must survive across sessions. It records prerequisites, routes work to OMP agents, and requires checks and reviews before marking tasks passed. For a small one-off edit that does not need a persistent roadmap, an ordinary OMP request may be simpler.
-
-There is no separate SHIP CLI, detached worker or terminal UI. Persistent state does not mean unattended execution: you advance work from an OMP session.
+Use ordinary OMP for a small one-off edit. Use SHIP when dependencies, explicit scope approval and progress across sessions matter. **Agents edit your checkout with your filesystem permissions; model calls can incur charges. Review the proposed scope and Git ownership before running work.**
 
 ## Install
 
-1. Install Node.js 22.6+ and Git.
-2. Follow the [OMP installation guide](https://github.com/can1357/oh-my-pi#install) and [provider authentication guide](https://github.com/can1357/oh-my-pi/blob/main/docs/providers.md). Confirm OMP can answer an ordinary request with your chosen model before adding SHIP. Installing SHIP's dependencies does not configure OMP authentication.
-3. Make `sh` available on PATH for verification commands. On Windows, also make PowerShell available; Git for Windows supplies `sh`.
-
-Install SHIP from a local checkout:
+Install Node.js 22.6+, Git, and [OMP](https://github.com/can1357/oh-my-pi). Authenticate an OMP model and confirm an ordinary request works. Make `sh` available for checks (Git for Windows provides it); Windows also needs PowerShell. SHIP requires OMP's `task` agent for planning; implementation may use `task`, `sonic`, `reviewer` or `security-reviewer`. Configure accessible `@plan` and `@slow` roles before work routed to them. SHIP does not configure a provider or own an API key.
 
 ```bash
 git clone https://github.com/garrettlabs/ship.git Ship
 cd Ship
 npm ci
-omp plugin link "/path/to/Ship"
+omp plugin link "/absolute/path/to/Ship"
+omp --cwd "/absolute/path/to/your-project"
 ```
 
-Replace `/path/to/Ship` with the absolute path of the checkout you just cloned; quote paths containing spaces. The link uses that checkout, so keep it in place. Start a new interactive OMP session in the **project you want to change**, not the SHIP checkout:
+Alternatively load the extension with `omp --extension "/absolute/path/to/Ship/extensions/ship.ts" --cwd "/absolute/path/to/your-project"`. Keep the linked checkout installed. Run OMP **in the project**, not in the SHIP checkout.
 
-```bash
-omp --cwd "/path/to/your-repo"
+## First approved run
+
+Start in a disposable Git repository with an existing declared test command and a bounded change:
+
+```text
+/ship add "Add a boundary-case test for the existing public parser and run the declared tests"
+/ship status
+/ship run
 ```
 
-Alternatively, skip `omp plugin link` and load the extension directly:
+First-use `/ship add` or `/ship change` adopts the repository in place. It profiles current instructions and declared checks, then asks the OMP planner for a draft. **Planning is not execution:** the draft waits for review. `/ship status` shows the pending request, affected scope, current tasks, ready work and approval boundary. `/ship run` offers **Approve and run**, **Approve only**, **Reject**, or **Cancel**. Consequential changes require another explicit confirmation. Rejection retains the approved roadmap and records the reason. Approve-only saves the new roadmap and selected run target without dispatching agents; return to `/ship run` to execute that saved target. An agent's outcome is not verification: SHIP runs required checks and requests independent/security reviews before marking a task passed.
 
-```bash
-omp --extension "/path/to/Ship/extensions/ship.ts" --cwd "/path/to/your-repo"
+`/ship init` optionally performs read-only reconnaissance before choosing a goal. For an existing checkout, review the scout summary before approving `.ship/DISCOVERY.md`; it is observed context, **not authorization to edit**. Then supply a goal with `/ship add "..."` or `/ship change "..."`. For a new empty project, `/ship init` asks for a nonempty brief file; `/ship run` drafts its first roadmap. SHIP does not infer a goal from reconnaissance.
+
+## Evolve an approved roadmap
+
+```text
+/ship add "Add an export workflow to the existing application"
+/ship change "Split the remaining import work and defer the optional cache"
+/ship status M001/S01/T01
+/ship run
 ```
 
-### OMP models and roles
+Describe desired outcomes in ordinary language. The planner proposes operations against stable milestone/slice/task IDs: add a slice or milestone, revise or split unstarted work, or defer, cancel or supersede work. A completed or attempted task and its evidence cannot be rewritten. Unfinished prerequisites are not silently counted as complete; successor dependencies must be rewired to all replacement tasks. Later milestones may remain outline-only until their executable slice is expanded and approved. Proposals show affected scope and verification before approval; an input request alone never grants execution. `/ship status [M001/S01/T01]` reads current state without launching a worker.
 
-SHIP uses OMP's existing authentication, models and task agents; there is no separate SHIP provider configuration. First-use planning requires OMP's `task` agent. Ordinary implementation also uses `task`; bounded lightweight work can use the `smol` route and `sonic` agent, while some small tasks can run in the main session. Ensure those OMP agents are available and can use an authenticated model. Agent names and model-role aliases are different settings.
+Tentative requests (for example, “maybe add this later”) offer **Capture for later** instead of planning. `/ship promote` selects a saved idea when it becomes an explicit request. Captures are unplanned context, not an accepted decision or authorization. Accepted user decisions, reconnaissance observations, unresolved assumptions, prerequisite outcomes and recorded evidence references stay distinct in bounded planner/worker context. Current repository instructions take precedence over cached discovery.
 
-Design and demanding implementation/review routes use `@plan` and `@slow`. Those routes are blocked if the selected role cannot resolve to a model.
+## Verification and human decisions
 
-Before using those routes, configure the roles through OMP's model/role settings with models you can access. See [OMP settings](https://github.com/can1357/oh-my-pi/blob/main/docs/settings.md) for `modelRoles` and [task-agent discovery](https://github.com/can1357/oh-my-pi/blob/main/docs/task-agent-discovery.md) for agent configuration. A working main-session model alone does not guarantee every selected role is available. Jev is optional and is not needed for the first run.
+Code work needs a passing executable verification command; SHIP will not invent one. Research, design, reconnaissance and documentation work can use an actual workspace artifact with an answer and supported findings for each current acceptance criterion instead of a fake shell command. Required independent/security reviews and configured protected checks still apply. Evidence is bound to task acceptance and artifact fingerprints; changing acceptance or artifact content invalidates prior proof. If acceptance explicitly requires human evaluation, use `/ship verify M001/S01/T01` in the **interactive main session** to read the recorded evidence and approve it yourself. Agents cannot assert human acceptance. Failed checks, adverse review findings and missing evidence never count as success.
 
-## Complete your first run
+Repository checks discovered from manifests can change. SHIP records package-script definitions and Makefile recipes alongside the runnable commands, compares them again before each check, and stops on drift. Review the exact old/new check policy and affected tasks with `/ship reconcile` before adopting a changed script, recipe, runner or command; a changed check cannot silently certify earlier work. A planner's task-specific shell commands appear verbatim in the proposal preview and require explicit main-session approval; YOLO cannot authorize new planner-authored command text. Likewise, reconcile previously dirty user-owned files only after reviewing their current Git status. SHIP preserves unrelated edits, checks branch and ownership before dispatch, and does not reset your files.
 
-Start with a small change in an existing Git repository whose dependencies and checks already work. A disposable repository is a good place to learn the workflow.
+The policy fingerprint covers all package scripts (including lifecycle hooks) and the complete local Makefile; unsupported Makefile includes are not guessed into executable checks. It is a declaration-drift gate, not a sandbox or a guarantee that repository code and external tools cannot change while a command runs. Review proposed shell commands and changed repository scripts as executable code.
 
-**Agents can modify your checkout with your normal filesystem permissions; they are not sandboxes. Model calls may incur provider charges.** Planning itself is not permission to edit source, but this workflow proceeds to execution; it is not a plan-preview-only mode.
+## Scheduler controls
 
-1. **Request a bounded change.** In the interactive OMP session, enter:
-
-   ```text
-   /ship add "Add a test covering an existing public function's boundary case; follow this repo's conventions and run its declared test command"
-   ```
-
-   Choose a behavior you can check, and name the real verification command if the repository does not declare one. First-use `/ship add` or `/ship change` adopts the checkout, discovers guidance/checks, creates `.ship/` state and starts planning. No initialization wizard is required. Use `/ship change "request"` instead when changing existing behavior.
-
-   To inspect an existing codebase **before** choosing a change, use `/ship init` instead. SHIP detects existing project files, gathers a bounded project profile, and asks an OMP read-only `scout` agent for reconnaissance. Review the agent's summary before approving `.ship/DISCOVERY.md`; it records observed purpose, layout, commands, conventions and unknowns, **not** a goal or roadmap. Then use `/ship add "goal"` or `/ship change "goal"` to start planning. `/ship run` alone will not plan a discovery-only project. If the directory has no recognizable project files, `/ship init` instead asks for a nonempty brief file; that new-project brief supplies the goal for a later `/ship run`.
-
-2. **Inspect the plan and progress.** After the planner responds, enter:
-
-   ```text
-   /ship status
-   ```
-
-   Read `.ship/EXECUTION_PLAN.md` for task goals, dependencies, ownership, routes and verification requirements. Check `.ship/project-profile.json` if expected repository guidance or checks are missing. SHIP does not guess undiscovered commands.
-
-3. **Advance work in the same session.** If planning or dispatch has not advanced, enter:
-
-   ```text
-   /ship run
-   ```
-
-   Review the confirmation prompt. OMP performs ready assignments and reports their outcomes; SHIP runs applicable checks and requires any necessary independent reviews. Use `/ship status` to inspect progress and `/ship run` when another explicit advance is needed. There is no background scheduler. If blocked, resolve the reported cause using [Troubleshooting](#troubleshooting), rather than repeatedly dispatching.
-
-4. **Check completion, not just the agent's reply.** Run `/ship status` again. Inspect the generated roadmap for task states and `.ship/attempts/` for verification evidence. A task is `passed` only after its required checks and reviews pass; the project reaches `complete` only after all tasks and any configured integration checks pass. Review the resulting source diff yourself.
-
-Saved progress remains in the project when you reopen OMP. A new session can inspect status, but cannot silently take over outstanding assignments; see [Recovery](#recovery-and-safety-limits).
-
-## Command reference
-
-In interactive OMP, type `/ship ` to see subcommands, or `/ship help` for the full command summary. Suggestions complete the subcommand only; requests after `/ship add` and `/ship change` remain free text.
-
-| Command | When to use it |
+| Command | Effect |
 | --- | --- |
-| `/ship add "request"` | First use: adopt and plan the request. With an existing roadmap: choose a slice and queue a fully specified new task. |
-| `/ship change "request"` | First use: adopt and plan a change to existing code. With a roadmap: choose a pending, never-attempted task and queue a goal/planning-hint edit. |
-| `/ship run` | Explicitly advance planning, process safe-boundary edits, reconcile the owning session's batch, or dispatch ready work. |
-| `/ship status` | Inspect phase, roadmap revision, task count, dispatch budget, active batch, and blocked reason; works from a nested project directory. |
-| `/ship pause` / `/ship resume` | Queue safe-boundary scheduler controls; resume can clear a blocked phase after its cause or budget is addressed. They do not pause OMP itself. |
-| `/ship init` | Optional smart initialization: research an existing codebase and approve a discovery summary without a goal, or request a brief file for a new project. Refuses to overwrite existing SHIP state. |
-| `/ship recover` | **Destructive, confirmed-dead-session takeover**; see [Recovery](#recovery-and-safety-limits). |
+| `/ship status [task ID]` | Read bounded progress, ready/blocked work, pending approvals and evidence. |
+| `/ship add "request"`, `/ship change "request"` | Ask for a reviewable initial or incremental proposal. |
+| `/ship promote` | Choose a captured idea to plan explicitly. |
+| `/ship run [task [M001/S01/T01] \| slice [M001/S01] \| milestone [M001] \| all]` | Review a pending proposal or advance approved work in the current OMP session. With no saved target, default to the first incomplete milestone. |
+| `/ship reconcile` | Review changed declared checks and eligible clean user-owned paths; rechecks Git/policy before applying. |
+| `/ship pause`, `/ship resume` | Queue scheduler controls for the next safe boundary. A clean handoff checkpoint allows another session to resume quiescent work after Git/progress revalidation. |
+| `/ship verify M001/S01/T01` | Approve required human evaluation in the main interactive session after inspecting evidence. |
+| `/ship yolo`, `/ship yolo off` | Enable or disable conservative same-session automatic approval/continuation. Default: supervised. |
+| `/ship recover` | Destructive takeover **only after the former session and all workers are confirmed dead**. |
 
-With an existing roadmap, `/ship add` requires at least one planned slice and asks for a title, goal, acceptance and verification shell command. `/ship change` requires a pending task with zero attempts and asks for a revised goal; started, failed and completed tasks cannot be changed this way. Both forms offer optional semantic type, uncertainty, dependency, ownership and verification hints. For example, `/ship add "Document the reset endpoint's error responses"` opens a task form after the password-reset roadmap exists. If no slice or eligible task appears, finish planning or choose another request rather than treating the command as applied.
+YOLO applies only to its initiating OMP session. It may approve routine, bounded proposals without new planner-authored shell commands and continue safe ready work without repeatedly asking. It does **not** bypass Git ownership, budgets, required checks/reviews, human evaluation, consequential scope choices, deployment, deletion, security or ambiguous product decisions. Unsafe proposals stay pending for user review; blocked work does not retry forever. Disable it with `/ship yolo off`.
 
-Submitting the form only queues an edit. `/ship run` applies queued edits at a safe boundary after checking the recorded roadmap revision and dependency graph; a stale or unsafe edit is rejected with a reason.
+The run target is persisted: `/ship run` resumes the saved scope, including after a safe session handoff, rather than silently widening to the whole roadmap. Choose `task` for the next incomplete task (or provide its stable ID), `slice` for the next incomplete slice (or provide its stable ID), `milestone` for the next incomplete milestone (or provide its endpoint ID), or `all` only when you intend to run the entire roadmap. A milestone includes unfinished work in earlier milestones, not just its own tasks. Supply a new scope or explicit ID to change the saved target; YOLO cannot expand it. `/ship status` displays the saved target, its verified/total task progress, and the supervised or same-session YOLO mode. Older states without a target remain untouched by status; their target is chosen on the next run. A future OMP goal ending at M002 can reuse the same persisted milestone endpoint to cover M001–M002. No SHIP-specific `/loop` orchestration is needed.
 
-| State to recognize | What to check |
-| --- | --- |
-| **Queued** | The command says *queued* and a request is in `.ship/inbox/`; the roadmap revision has not changed. |
-| **Applied** | After `/ship run` reaches a safe boundary, the roadmap revision and generated roadmap/plan views reflect the accepted edit. |
-| **Blocked** | `/ship status` reports `blocked` and a reason (such as a stale revision, overlapping user work, or failed checks); resolve the cause before `/ship resume` and `/ship run`. |
-| **Verified** | Task state is `passed` only after its required checks and reviews pass; inspect `.ship/attempts/` for check evidence. `complete` additionally requires any configured project integration checks. An agent's `passed` report alone is not proof. |
+Ready independent tasks can share a batch only when ownership and safety checks permit it. `maxParallelTasks` caps the number of assignments even when more are safe. Task attempts, dispatches and reviewer dispatches count against persisted budgets. Raise limits only deliberately; a missing command, conflict or required approval is not a budget problem.
 
-## Troubleshooting
+## State, recovery and configuration
 
-Start with `/ship status`; use its reason and `.ship/attempts/` or `.ship/events.jsonl` to identify the cause.
+`.ship/state.json` is authoritative; `.ship/ROADMAP.md` and `.ship/EXECUTION_PLAN.md` are generated views. `.ship/PROJECT.md` is the original brief, `.ship/project-profile.json` caches fingerprinted discovery, `.ship/KNOWLEDGE.md` presents recorded knowledge, `inbox/` holds safe-boundary messages, and `attempts/` and `events.jsonl` record verification and transitions. SHIP excludes `.ship/` using local Git excludes; that does not set a repository-wide `.gitignore`. Version-1 state is validated and backed up as `.ship/state.json.v1.backup` before migration to version 2; failed validation does not overwrite the original. Never delete an existing `.ship/` to bypass a state error.
 
-| Symptom | Action |
-| --- | --- |
-| `/ship` is missing | Link the checkout and start a new OMP session, or use the direct-load command under [Install](#install). |
-| Provider authentication fails | Fix authentication in OMP using its [provider guide](https://github.com/can1357/oh-my-pi/blob/main/docs/providers.md); SHIP has no separate model credentials. |
-| An OMP task agent is missing or cannot start | Check OMP's [agent discovery](https://github.com/can1357/oh-my-pi/blob/main/docs/task-agent-discovery.md) and model authentication. Initial planning needs `task`; lightweight work may use `sonic`. |
-| `@plan` or `@slow` is unavailable | Configure that role in OMP with an accessible model, then retry in the owning session. |
-| Planning or work is not advancing | Use `/ship run` in the session that owns the work. Status is observational; SHIP has no background scheduler. |
-| Dirty-file ownership or a branch change blocks work | Review the planned ownership and existing changes. Preserve user work and resolve the conflict before resuming; do not delete changes to bypass the guard. |
-| An edit is rejected as stale or unsafe | Inspect the current roadmap and rejection reason, then submit a corrected edit against the current revision. A queued request is not an applied change. |
-| A check fails or cannot execute | Inspect its evidence, fix the underlying failure or missing dependency, and ensure `sh` (plus PowerShell on Windows) is on PATH. Failed checks cannot count as success. |
-| Dispatch budget is exhausted | Review the cost/work remaining, then raise `limits.maxDispatches` in `.ship/config.json` if appropriate. Use `/ship resume`, then `/ship run`; reviewers also consume dispatches. |
-| Another session owns outstanding work | Return to that session. If it and all its workers have stopped, follow [Recovery](#recovery-and-safety-limits); do not recover while they may still write. |
-| `.ship/` exists but state is invalid | Inspect or archive the state before attempting a fresh initialization. Do not blindly delete it or assume automatic migration. |
-
-After resolving a blocked phase's cause, use `/ship resume` and `/ship run`. These commands do not waive ownership, verification or budget requirements.
-
-## How a run progresses
-
-1. The main OMP session asks a planner to submit a roadmap through `ship_plan`. SHIP validates task IDs, dependency levels, objectives, acceptance criteria, ownership and verification requirements as a dependency graph (DAG). A task is ready only after its prerequisites pass.
-2. SHIP classifies and routes ready tasks against the configured OMP roles. The main session receives concrete assignments and uses OMP task agents, or works directly if the selected route allows. Independently ready tasks can enter one parallel batch only when ownership and safety rules permit; overlapping or unclear ownership, risky migrations and destructive boundaries constrain parallelism. Assignments belong to the OMP session that started the batch.
-3. The main session reports results through `ship_outcome`. Required independent or security reviews use OMP agents; the report alone cannot waive them. SHIP runs applicable declared repository checks and protected checks before marking work passed, persists bounded evidence, then releases dependent tasks. Failed checks or missing substantive review evidence fail verification and may use the remaining repair/dispatch budget.
-
-New planner submissions include semantic type and an explainable task profile (1–10 complexity, uncertainty and risk, traits and rationale); older records without a profile get a marked structural estimate. Deterministic routing enforces hard role-capability, security, review and verification floors. OMP resolves a selected role against its live model configuration, rather than SHIP hardcoding a model provider. Estimated task-cost ranges use available configured role/pricing data; missing prices remain unknown.
-
-## Project knowledge, Git changes, and state
-
-SHIP looks for repository instructions (including `AGENTS.md`, `CLAUDE.md`, README/CONTRIBUTING and scoped guidance), ecosystem manifests, lockfiles, layout, migration hints and declared commands. Repository instructions take precedence over cached discovery and SHIP defaults. `.ship/project-profile.json` records bounded source fingerprints, discovered facts and explicit unknowns; changed sources refresh the profile. It is not a source-code index and an undiscovered check is **unknown**, not a guessed command. Task-specific architectural boundaries still require inspection.
-
-Before planning, SHIP snapshots Git branch and dirty paths, including untracked files and both sides of renames. It preserves existing changes: unclear or overlapping task ownership blocks work rather than treating those changes as disposable. Branch changes can block dispatch until ownership is reviewed. OMP agents work in your checkout with your normal filesystem permissions; **they are not sandboxes**. Inspect the proposed ownership and checks before letting work proceed.
-
-The local `.ship/` directory contains:
-
-| Location | Meaning |
-| --- | --- |
-| `PROJECT.md`, `config.json` | Explicit planning brief/goal (if supplied) and per-project scheduler/verification policy. |
-| `state.json` | Atomic authoritative snapshot: schema, roadmap revision, phase, tasks, attempts, assignments and budgets. |
-| `project-profile.json` | Rebuildable discovery facts, unknowns and source fingerprints. |
-| `DISCOVERY.md` | User-approved, evidence-based reconnaissance of an existing project; not a planning brief. |
-| `ROADMAP.md`, `EXECUTION_PLAN.json`, `EXECUTION_PLAN.md`, `KNOWLEDGE.md` | Generated human-readable roadmap/plan/knowledge views and machine-readable execution plan. |
-| `inbox/`, `events.jsonl`, `attempts/` | Queued safe-boundary changes, append-only event history, and verification evidence/logs. |
-| `lock/` | Short-lived state/check lock while a SHIP operation owns it. |
-
-Deleting `.ship/` removes SHIP's local state, not the source project. `/ship init` excludes `.ship/` from local Git tracking; do not assume that is a team-wide `.gitignore` rule. Existing version-1 config files with former `worker` and `review` fields remain readable, but those fields are ignored: no RPC worker is launched. Legacy standalone worktree or active-attempt metadata is a diagnostic boundary, not native completion; inspect or archive the old state before starting a fresh native project rather than expecting an implicit migration.
-
-## Configuration and optional Jev
-
-`.ship/config.json` is created with these defaults; edit limits/checks to match your repository:
+Default `.ship/config.json`:
 
 ```json
 {
   "schemaVersion": 1,
-  "limits": { "maxTaskAttempts": 3, "maxDispatches": 100 },
+  "limits": { "maxTaskAttempts": 3, "maxDispatches": 100, "maxParallelTasks": 2 },
   "verificationTimeoutMs": 300000,
   "protectedChecks": [],
   "judgment": { "enabled": false, "confidenceThreshold": 0.7, "timeoutMs": 20000 }
 }
 ```
 
-`maxTaskAttempts` bounds planning/task repairs; `maxDispatches` is a persistent budget for assignments, including reviewers. `verificationTimeoutMs` bounds each shell check. `protectedChecks` supplies commands run alongside task-specific declared verification. Checks run in the project with bounded time/output and process-tree supervision; a nonzero result or a check that cannot execute cannot become a verified success. A review requirement without an executable command instead needs substantive independent OMP review evidence. The verification process supervisor is **not** an agent sandbox.
+The config schema and state schema are separate. Protected checks run alongside task-specific requirements; a failing or unavailable check cannot pass. Checks run with bounded output/time and process-tree supervision, **not inside an agent sandbox**. Optional Jev routing uses OMP's public `jev_ask` tool only when configured; deterministic safety floors still apply and Jev cannot certify verification. [OMP model-role settings](https://github.com/can1357/oh-my-pi/blob/main/docs/settings.md) and [task-agent discovery](https://github.com/can1357/oh-my-pi/blob/main/docs/task-agent-discovery.md) describe provider setup.
 
-Routing is deterministic by default. To try optional Jev judgments, install and enable `@jev-harness/omp` in OMP, configure its credentials according to that extension, and set `judgment.enabled` to `true`. SHIP owns no Jev key, model setting, SDK client or alternate invocation path.
+A quiescent pause records a handoff summary and Git fingerprints. Another session can resume only if roadmap progress, branch, HEAD, dirty paths and their contents still match; otherwise inspect and resolve the discrepancy. **Do not use `/ship recover` for an ordinary safe handoff.** Recovery is for confirmed-dead work: it marks pending assignments failed, consumes attempts, and may dispatch a paid repair. SHIP cannot detect whether another OMP worker is alive or prevent it from modifying the checkout. Return to the owning session if any worker may still run.
 
-SHIP asks the **main OMP session** to call the public `jev_ask` tool with bounded semantic choices, then correlates the result before dispatch. If the tool is unavailable, the main session calls `ship_judgment` with the pending ID and `status: "unavailable"`. Each field has its own confidence gate: low-confidence choices use the deterministic value; malformed/ineligible answers, tool errors and expiry fall back without retry. Jev can escalate classification or review, never lower deterministic security/capability floors or certify verification.
+If blocked, start with `/ship status` and inspect `.ship/attempts/` and `.ship/events.jsonl`. Fix the reported check, missing provider role, Git conflict, approval or budget cause; then `/ship resume` and `/ship run` in the appropriate session. A plain `/ship run` resumes the persisted target; to choose another scope, specify it explicitly. Status itself does not change the work plan or launch an agent.
 
-A pending judgment holds dispatch and queued roadmap edits. If the invocation never returns, use `/ship run` after `timeoutMs` to expire it. Disabling Jev affects future undecided routes, not running assignments. Persisted routing decisions and optional normalized semantic judgments contain no credentials or full Jev prompts.
+## Developer checks and repeatable smoke
 
-**Jev remains experimental, not the default recommendation.** Fallback and simulated runs do not establish successful-call quality, latency or cost.
-
-## Recovery and safety limits
-
-Use `/ship status` first; inspect `.ship/state.json`, `.ship/events.jsonl` and `.ship/attempts/` to distinguish queued, running, failed, budget-blocked and verified work. In the original owning OMP session, `/ship run` can reconcile stored progress. A different session cannot claim outstanding planning or batch work simply by running it. A blocked review awaiting dispatch budget remains pending; raise `limits.maxDispatches`, then `/ship resume` and `/ship run` to dispatch its reviewer.
-
-`/ship recover` is **destructive**. Before confirming it, independently establish that the former OMP session **and every outstanding worker** have stopped. SHIP cannot inspect OMP worker liveness or kill them, and it refuses a live SHIP lock owner. Recovery transfers batch ownership, marks pending assignments failed and consumes their current attempts; interrupted planning also consumes a planning attempt. It can dispatch paid repair work immediately or exhaust a budget. Never recover while former workers may still be writing in the checkout. SHIP does not promise to resolve conflicting source changes or resume a dead agent's in-memory work.
-
-## Manual smoke and developer checks
-
-In a **throwaway** Git repository with a small declared test command, start OMP with the extension and run `/ship add "add a small behavior with a test"`. Use `/ship status`; inspect `.ship/project-profile.json` for actual discovered guidance/checks and `.ship/EXECUTION_PLAN.md` for dependencies, routes and verification. Queue a later `/ship change` before its task starts, observe that it is queued rather than applied, then `/ship run` and confirm the revision changes only at the safe boundary. In a separate throwaway run, dirty a file before first use and confirm overlapping or uncertain ownership blocks instead of discarding it. For completed work, inspect ordered events and passing evidence in `.ship/attempts/`, then reopen OMP and confirm status persists.
-
-Test recovery **only in a disposable repository**: start a pending assignment, stop its owning OMP session and all workers, then confirm `/ship recover` in a new session. Check the failed assignment, consumed attempt, transferred ownership and any immediate repair dispatch. For a budget-blocked review, confirm the reviewer stays pending until you raise the budget, `/ship resume`, and `/ship run`.
-
-From a development checkout, `npm test` runs domain planning, migration, native scheduling/edit and verification tests; `npm run check` typechecks. The npm package includes the extension and runtime source, not development tests or fixtures. Keep the package and `omp` versions aligned for releases. There is no shipped standalone worker CLI, RPC fixture or fake-worker demo.
+Run `npm test` and `npm run check` in the SHIP checkout. CI exercises both Windows and Linux. For a live journey, create a **throwaway** Git repo with a small source function, package manifest and declared test script; make an initial commit. Launch OMP with the linked extension inside that repo. Request a boundary-case change, inspect `/ship status`, reject an intentionally wrong first draft, request a corrected one, approve it without running, then `/ship run` and inspect `.ship/attempts/` for checks and reviews. Capture a tentative idea, promote it, inspect the revision preview, approve it, pause after the batch settles, and reopen OMP to validate a clean resume. Separately exercise a human-evaluation task with `/ship verify`. Verify that any deliberately dirty file is protected, and test `/ship recover` only after terminating the owning session **and all workers**. Never run destructive-recovery smoke in a real project.
