@@ -57,6 +57,8 @@ Start with a small change in an existing Git repository whose dependencies and c
 
    Choose a behavior you can check, and name the real verification command if the repository does not declare one. First-use `/ship add` or `/ship change` adopts the checkout, discovers guidance/checks, creates `.ship/` state and starts planning. No initialization wizard is required. Use `/ship change "request"` instead when changing existing behavior.
 
+   To inspect an existing codebase **before** choosing a change, use `/ship init` instead. SHIP detects existing project files, gathers a bounded project profile, and asks an OMP read-only `scout` agent for reconnaissance. Review the agent's summary before approving `.ship/DISCOVERY.md`; it records observed purpose, layout, commands, conventions and unknowns, **not** a goal or roadmap. Then use `/ship add "goal"` or `/ship change "goal"` to start planning. `/ship run` alone will not plan a discovery-only project. If the directory has no recognizable project files, `/ship init` instead asks for a nonempty brief file; that new-project brief supplies the goal for a later `/ship run`.
+
 2. **Inspect the plan and progress.** After the planner responds, enter:
 
    ```text
@@ -79,6 +81,8 @@ Saved progress remains in the project when you reopen OMP. A new session can ins
 
 ## Command reference
 
+In interactive OMP, type `/ship ` to see subcommands, or `/ship help` for the full command summary. Suggestions complete the subcommand only; requests after `/ship add` and `/ship change` remain free text.
+
 | Command | When to use it |
 | --- | --- |
 | `/ship add "request"` | First use: adopt and plan the request. With an existing roadmap: choose a slice and queue a fully specified new task. |
@@ -86,7 +90,7 @@ Saved progress remains in the project when you reopen OMP. A new session can ins
 | `/ship run` | Explicitly advance planning, process safe-boundary edits, reconcile the owning session's batch, or dispatch ready work. |
 | `/ship status` | Inspect phase, roadmap revision, task count, dispatch budget, active batch, and blocked reason; works from a nested project directory. |
 | `/ship pause` / `/ship resume` | Queue safe-boundary scheduler controls; resume can clear a blocked phase after its cause or budget is addressed. They do not pause OMP itself. |
-| `/ship init` | Optional brief-file workflow: confirm a nonempty project brief, initialize Git if needed, and initialize `.ship/`; refuses to overwrite existing SHIP state. |
+| `/ship init` | Optional smart initialization: research an existing codebase and approve a discovery summary without a goal, or request a brief file for a new project. Refuses to overwrite existing SHIP state. |
 | `/ship recover` | **Destructive, confirmed-dead-session takeover**; see [Recovery](#recovery-and-safety-limits). |
 
 With an existing roadmap, `/ship add` requires at least one planned slice and asks for a title, goal, acceptance and verification shell command. `/ship change` requires a pending task with zero attempts and asks for a revised goal; started, failed and completed tasks cannot be changed this way. Both forms offer optional semantic type, uncertainty, dependency, ownership and verification hints. For example, `/ship add "Document the reset endpoint's error responses"` opens a task form after the password-reset roadmap exists. If no slice or eligible task appears, finish planning or choose another request rather than treating the command as applied.
@@ -138,14 +142,15 @@ The local `.ship/` directory contains:
 
 | Location | Meaning |
 | --- | --- |
-| `PROJECT.md`, `config.json` | Saved brief and per-project scheduler/verification policy. |
+| `PROJECT.md`, `config.json` | Explicit planning brief/goal (if supplied) and per-project scheduler/verification policy. |
 | `state.json` | Atomic authoritative snapshot: schema, roadmap revision, phase, tasks, attempts, assignments and budgets. |
 | `project-profile.json` | Rebuildable discovery facts, unknowns and source fingerprints. |
+| `DISCOVERY.md` | User-approved, evidence-based reconnaissance of an existing project; not a planning brief. |
 | `ROADMAP.md`, `EXECUTION_PLAN.json`, `EXECUTION_PLAN.md`, `KNOWLEDGE.md` | Generated human-readable roadmap/plan/knowledge views and machine-readable execution plan. |
 | `inbox/`, `events.jsonl`, `attempts/` | Queued safe-boundary changes, append-only event history, and verification evidence/logs. |
 | `lock/` | Short-lived state/check lock while a SHIP operation owns it. |
 
-Deleting `.ship/` removes SHIP's local state, not the source project. Optional `/ship init` excludes `.ship/` from local Git tracking; do not assume that is a team-wide `.gitignore` rule. Existing version-1 config files with former `worker` and `review` fields remain readable, but those fields are ignored: no RPC worker is launched. Legacy standalone worktree or active-attempt metadata is a diagnostic boundary, not native completion; inspect or archive the old state before starting a fresh native project rather than expecting an implicit migration.
+Deleting `.ship/` removes SHIP's local state, not the source project. `/ship init` excludes `.ship/` from local Git tracking; do not assume that is a team-wide `.gitignore` rule. Existing version-1 config files with former `worker` and `review` fields remain readable, but those fields are ignored: no RPC worker is launched. Legacy standalone worktree or active-attempt metadata is a diagnostic boundary, not native completion; inspect or archive the old state before starting a fresh native project rather than expecting an implicit migration.
 
 ## Configuration and optional Jev
 

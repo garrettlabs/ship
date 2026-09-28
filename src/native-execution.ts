@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { lstat, mkdir, readFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { DependencyGraph } from "./dependency-graph.ts";
 import { tasks, refresh, parsePlan, recomputeJudgedTask } from "./model.ts";
@@ -10,6 +10,7 @@ import { acquireLock } from "./lock.ts";
 import { discoverRepoChecks, routeVerification } from "./verification.ts";
 import { appendEvent, atomicJson, consumeInbox, loadConfig, loadState, saveState, shipDir, writeRoadmapView } from "./store.ts";
 import { gitDirtySnapshot, readProjectProfile, type GitDirtySnapshot } from "./project-profile.ts";
+import { recoverDiscovery, restartDiscovery, setDiscoveryGoal } from "./project.ts";
 import { assertNoProcess } from "./process.ts";
 import type { Milestone, NativeAssignment, NativeBatch, RepoCheck, ShipConfig, ShipState, Task } from "./types.ts";
 import { applyDecision, confidenceThreshold, eligibleRoles, fallback, hashJudgmentRequest, judgmentTimeoutMs, parseChoice, parseSemanticAnswers, semanticTaskTypes } from "./judgment.ts";
@@ -226,6 +227,7 @@ function chooseBatch(state: ShipState, config: ShipConfig, sessionId: string): N
   return batch;
 }
 async function advance(root: string, state: ShipState, config: ShipConfig, sessionId: string, routing?: RoutingContext): Promise<string> {
+  if (state.discovery && !state.discovery.goalSet) return "SHIP blocked: discovery has no explicit goal. Use /ship add \"goal\" or /ship change \"goal\" before planning.";
   if (state.paused || state.phase === "blocked") return `SHIP ${state.paused ? "paused" : `blocked: ${state.blockedReason}`}. No assignments dispatched.`;
   if (state.pendingJudgment) {
     if (state.pendingJudgment.sessionId !== sessionId) return "SHIP judgment belongs to another OMP session; resume it there.";
@@ -368,9 +370,59 @@ async function advance(root: string, state: ShipState, config: ShipConfig, sessi
   await persist(root, state, "native_batch_started", { batch: batch.id, tasks: batch.assignments.map(a => a.key) });
   return instructions(root, batch, state);
 }
+/** Establish the first goal under the same project lock as discovery approval. */
+export function setNativeDiscoveryGoal(root: string, request: string): Promise<void> {
+  return serialized(root, () => setDiscoveryGoal(root, request));
+}
+/** Restart cancelled research under the same project lock as submission and goal setting. */
+export function restartNativeDiscovery(root: string, sessionId: string): Promise<string> {
+  return serialized(root, () => restartDiscovery(root, sessionId));
+}
+
+
+/** Discovery is research only. The correlated main session and user must both approve persistence. */
+export function submitNativeDiscovery(root: string, sessionId: string, discoveryId: string, summary: string,
+  approve: (summary: string) => Promise<boolean>): Promise<string> {
+  return serialized(root, async () => {
+    const state = await loadState(root);
+    if (!state.discovery || state.discovery.id !== discoveryId || state.discovery.sessionId !== sessionId ||
+        state.discovery.status !== "researching" || state.discovery.goalSet || state.nativePlanning || state.nativeBatch ||
+        state.milestones.length) throw new Error("Stale or foreign discovery assignment");
+    if (!summary.trim() || summary.length > 6000) throw new Error("Discovery summary must contain 1–6000 characters");
+    const file = path.join(shipDir(root), "DISCOVERY.md");
+    let existing: string | undefined;
+    try { existing = await readFile(file, "utf8"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (existing !== undefined && (!existing.trim() || existing.length > 6001))
+      throw new Error("Unapproved DISCOVERY.md exists but is empty or too large; inspect it before continuing");
+    const proposed = summary.trim() + "\n";
+    const reviewed = existing ?? proposed;
+    const previous = existing !== undefined && existing !== proposed;
+    if (!await approve(previous
+      ? `An unapproved DISCOVERY.md survived interrupted approval. Review and approve the existing summary below instead of the new research result:\n\n${reviewed}`
+      : reviewed)) {
+      state.discovery.status = "cancelled";
+      await saveState(root, state);
+      return "SHIP discovery cancelled; no summary approved. Use /ship init to restart discovery.";
+    }
+    if (existing === undefined) {
+      try { await writeFile(file, proposed, { flag: "wx" }); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST" || await readFile(file, "utf8") !== proposed) throw error;
+      }
+    } else if (await readFile(file, "utf8") !== existing) {
+      throw new Error("DISCOVERY.md changed during approval; review it again before continuing");
+    }
+    state.discovery.status = "approved";
+    await saveState(root, state);
+    return "SHIP discovery approved and saved to .ship/DISCOVERY.md. No goal was inferred; use /ship add \"goal\" or /ship change \"goal\" before /ship run.";
+  });
+}
+
 export function startNativeRun(root: string, sessionId: string, routing?: RoutingContext): Promise<string> {
   return serialized(root, async () => {
     const state = await loadState(root);
+    if (state.discovery && !state.discovery.goalSet) return "SHIP blocked: discovery has no explicit goal. Use /ship add \"goal\" or /ship change \"goal\" before planning.";
     if (state.workspace) throw new Error("Standalone worktree state cannot be reused in OMP's checkout; use a fresh native project");
     if (state.activeAttempt) throw new Error("A standalone controller attempt is active; reconcile it before OMP-native execution");
     if (!state.preexistingWork) {
@@ -388,6 +440,10 @@ export function recoverNativeRun(root: string, sessionId: string, routing?: Rout
   return serialized(root, async () => {
     await assertNoProcess(root);
     const state = await loadState(root), config = await loadConfig(root);
+    if (state.discovery && !state.discovery.goalSet) {
+      if (state.discovery.status === "researching") return recoverDiscovery(root, sessionId);
+      return "SHIP blocked: discovery has no explicit goal. Use /ship init to restart cancelled discovery, or /ship add \"goal\" or /ship change \"goal\" after approval.";
+    }
     if (state.workspace || state.activeAttempt) throw new Error("Standalone execution requires separate recovery");
     if (state.nativeBatch) {
       const batch = state.nativeBatch;
@@ -427,6 +483,7 @@ export function submitNativePlan(root: string, sessionId: string, planningId: st
     const state = await loadState(root), config = await loadConfig(root);
     if (state.workspace || state.nativeBatch || state.milestones.length || !state.nativePlanning ||
         state.nativePlanning.id !== planningId || state.nativePlanning.sessionId !== sessionId) throw new Error("Stale or foreign native planning assignment");
+    if (state.discovery && !state.discovery.goalSet) throw new Error("Discovery has no explicit goal; native planning is forbidden");
     await readProjectProfile(root);
     const current = await gitDirtySnapshot(root);
     if (state.preexistingWork) {

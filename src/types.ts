@@ -84,6 +84,12 @@ export interface NativeBatch {
   id: string; sessionId: string; revision: number; stage: "executing" | "reviewing"; assignments: NativeAssignment[]; settling?: boolean; awaitingBudget?: boolean;
 }
 export interface NativePlanning { id: string; sessionId: string; attempts: number; }
+export interface DiscoveryState {
+  id: string;
+  sessionId: string;
+  status: "researching" | "cancelled" | "approved";
+  goalSet?: boolean;
+}
 export interface ShipState {
   schemaVersion: 1; projectName: string; phase: RunPhase; roadmapRevision: number;
   milestones: Milestone[]; current?: { milestoneId: string; sliceId: string; taskId?: string };
@@ -97,6 +103,7 @@ export interface ShipState {
   lastHead?: string; partialTree?: string; activeAttempt?: Attempt; dispatches?: number; planningFailures?: number;
   nativeBatch?: NativeBatch;
   nativePlanning?: NativePlanning;
+  discovery?: DiscoveryState;
   pendingJudgment?: PendingJudgment;
   knowledge?: Knowledge[]; processedInbox?: string[];
 }

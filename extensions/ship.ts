@@ -2,10 +2,10 @@ import { realpath } from "node:fs/promises";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { exists, loadState, queueMessage, queueRoadmapEdit, shipDir } from "../src/store.ts";
-import { bootstrap, initialize } from "../src/project.ts";
+import { bootstrap, hasExistingProject, initialize, initializeDiscovery } from "../src/project.ts";
 import { git } from "../src/git.ts";
 import { recoverLock } from "../src/lock.ts";
-import { completeNativeJudgment, confirmNativeSpecialist, recoverNativeRun, reportNativeOutcome, routeNativeSpawn, startNativeRun, submitNativePlan, type NativeOutcome, type RoutingContext } from "../src/native-execution.ts";
+import { completeNativeJudgment, confirmNativeSpecialist, recoverNativeRun, reportNativeOutcome, restartNativeDiscovery, routeNativeSpawn, setNativeDiscoveryGoal, startNativeRun, submitNativeDiscovery, submitNativePlan, type NativeOutcome, type RoutingContext } from "../src/native-execution.ts";
 import type { ExecutionRole, RoadmapEdit } from "../src/types.ts";
 import { hashJudgmentRequest } from "../src/judgment.ts";
 
@@ -30,7 +30,18 @@ function isNativeOutcome(value: unknown): value is NativeOutcome {
     typeof value.summary === "string";
 }
 
-const help = "Ship commands: /ship add \"request\" or /ship change \"request\" (adopt a repository and plan on first use); /ship init (optional initialization from a brief); /ship run (trigger native OMP planning and task dispatch); /ship add and /ship change (queue safe-boundary roadmap edits after planning); /ship status (inspect persisted progress); /ship pause and /ship resume (safe-boundary stop/recovery); /ship recover (only after confirming all former OMP workers are dead; reconcile lost native work and clear a dead SHIP lock). OMP owns agents and sessions.";
+const help = "Ship commands: /ship init (read-only scout discovery at Git root for existing projects, brief for empty projects); /ship add \"goal\" or /ship change \"goal\" (explicit goal after approved discovery, or first-use adoption); /ship run (only after a goal); /ship status; /ship pause; /ship resume; /ship recover (confirmed-dead session, including pending research). Existing roadmap edits remain available through add/change. OMP owns agents and sessions.";
+const commands = [
+  { name: "add", description: "Plan a new request or queue a task" },
+  { name: "change", description: "Plan a change or queue a goal edit" },
+  { name: "run", description: "Advance planning or ready work" },
+  { name: "status", description: "Inspect project progress" },
+  { name: "pause", description: "Queue a pause at a safe boundary" },
+  { name: "resume", description: "Resume blocked or paused work" },
+  { name: "init", description: "Scout existing project at Git root or initialize from a brief" },
+  { name: "recover", description: "Recover a confirmed-dead session (destructive)" },
+  { name: "help", description: "Show all SHIP commands" },
+] as const;
 const assignmentName = /^Ship([0-9a-f]{26})$/;
 function taskItems(input: Record<string, unknown>): Record<string, unknown>[] {
   return Array.isArray(input.tasks) ? input.tasks.filter((item): item is Record<string, unknown> => item !== null && typeof item === "object")
@@ -126,6 +137,25 @@ export function createShipExtension() {
       }
     });
     api.registerTool({
+      name: "ship_discovery",
+      label: "Review SHIP discovery",
+      description: "Submit a correlated read-only project reconnaissance summary from the assigned OMP task. The user must explicitly confirm the summary before it is persisted; this tool cannot plan or execute.",
+      parameters: z.object({ discoveryId: z.string(), summary: z.string() }),
+      async execute(_id, params, _signal, _update, ctx) {
+        try {
+          if (ctx.agent.kind !== "main" || !ctx.hasUI) throw new Error("Only the interactive main OMP session can submit discovery");
+          if (!params || typeof params !== "object" || !("discoveryId" in params) || typeof params.discoveryId !== "string" ||
+              !("summary" in params) || typeof params.summary !== "string") throw new Error("Invalid SHIP discovery fields");
+          const root = await projectRoot(ctx.cwd);
+          const next = await submitNativeDiscovery(root, ctx.sessionManager.getSessionId(), params.discoveryId, params.summary,
+            summary => ctx.ui.confirm("Approve read-only SHIP discovery?", `${summary}\n\nSave this summary to .ship/DISCOVERY.md? No goal or plan will be created.`));
+          return { content: [{ type: "text", text: next }] };
+        } catch (error) {
+          return { content: [{ type: "text", text: `SHIP discovery rejected: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+        }
+      },
+    });
+    api.registerTool({
       name: "ship_plan",
       label: "Ship execution plan",
       description: "Submit the assigned OMP planner's complete raw JSON answer (not Markdown or fenced text) as plan, with the active planningId. Required top-level JSON: {\"milestones\":[{\"id\":\"M001\",\"title\":\"...\",\"outcome\":\"...\",\"slices\":[{\"id\":\"S01\",\"title\":\"...\",\"tasks\":[{\"id\":\"T01\",\"title\":\"...\",\"objective\":\"...\",\"goal\":\"...\",\"dependencies\":[],\"acceptance\":[\"...\"],\"affectedDomains\":[],\"affectedFiles\":[],\"taskType\":\"implementation\",\"uncertainty\":\"UNKNOWN\",\"profile\":{\"complexity\":5,\"uncertainty\":5,\"risk\":5,\"traits\":[],\"rationale\":[\"Bounded scope\"]},\"verificationRequirements\":[\"...\"],\"verificationCommands\":[\"...\"]}]}]}]}. Every new task MUST include an explicit taskType, uncertainty and numeric 1–10 profile (complexity/uncertainty/risk, traits, rationale). Do not submit prose, fences, derived route/status/attempt fields, or plans missing slices.",
@@ -186,11 +216,17 @@ export function createShipExtension() {
     });
     api.registerCommand("ship", {
       description: "Initialize and manage native Ship project planning (/ship for help)",
+      getArgumentCompletions(prefix) {
+        if (/\s/.test(prefix)) return null;
+        const matches = commands.filter(command => command.name.startsWith(prefix.toLowerCase()))
+          .map(command => ({ label: command.name, value: `${command.name} `, description: command.description }));
+        return matches.length ? matches : null;
+      },
       async handler(args: string, ctx: ExtensionCommandContext): Promise<void> {
         const [action = "help", ...rest] = args.trim().split(/\s+/);
         const initialRequest = rest.join(" ").trim().replace(/^(['"])(.*)\1$/, "$2");
         if (action === "help") { ctx.ui.notify(help, "info"); return; }
-        if (!["init", "status", "run", "pause", "resume", "recover", "add", "change"].includes(action)) {
+        if (!commands.some(command => command.name === action)) {
           ctx.ui.notify(`Unknown Ship command: ${action}. ${help}`, "error"); return;
         }
         if (["init", "run", "recover", "add", "change"].includes(action) && !ctx.hasUI) {
@@ -198,11 +234,26 @@ export function createShipExtension() {
         }
         try {
           if (action === "init") {
+            if (initialRequest) throw new Error("Use /ship init without arguments; SHIP chooses discovery or a brief automatically");
             if (ctx.agent.kind !== "main") throw new Error("Initialize SHIP from the main OMP session");
+            const root = await git(ctx.cwd, ["rev-parse", "--show-toplevel"]).catch(() => realpath(ctx.cwd));
+            if (await exists(shipDir(root))) {
+              const state = await loadState(root);
+              if (state.discovery?.status !== "cancelled" || state.discovery.goalSet) throw new Error(".ship already exists; refusing to overwrite it");
+              const next = await restartNativeDiscovery(root, ctx.sessionManager.getSessionId());
+              api.sendUserMessage(next);
+              ctx.ui.notify("SHIP discovery restarted; awaiting read-only OMP research.", "info");
+              return;
+            }
+            if (await hasExistingProject(root)) {
+              const next = await initializeDiscovery(root, ctx.sessionManager.getSessionId());
+              api.sendUserMessage(next);
+              ctx.ui.notify("SHIP · read-only discovery started. Review its summary before approving; no goal or plan has been created.", "info");
+              return;
+            }
             const brief = await ctx.ui.input("Project brief", "Path to a nonempty brief file in this checkout");
             if (brief === undefined) return;
             if (!brief.trim()) throw new Error("Project brief path cannot be empty");
-            const root = await realpath(ctx.cwd);
             if (!await ctx.ui.confirm("Initialize SHIP?", `Use ${brief.trim()} as the project brief in ${root}? Existing .ship state will not be overwritten.`)) return;
             await initialize(root, brief.trim());
             ctx.ui.notify("SHIP initialized. Use /ship run to plan and dispatch tasks in this OMP session.", "info");
@@ -221,30 +272,41 @@ export function createShipExtension() {
             ctx.ui.notify("SHIP · learning project", "info");
             await bootstrap(root, request);
             const next = await startNativeRun(root, ctx.sessionManager.getSessionId());
-            if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
+            if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next);
             ctx.ui.notify(next.startsWith("SHIP OMP-native") ? "SHIP · project profile ready; planning change" : next, next.startsWith("SHIP blocked") ? "warning" : "info");
+            return;
+          }
+          const discoveryState = (action === "add" || action === "change") ? (await loadState(root)).discovery : undefined;
+          if (discoveryState && !discoveryState.goalSet) {
+            if (ctx.agent.kind !== "main") throw new Error("Set a discovery goal from the main OMP session");
+            const request = initialRequest || await ctx.ui.input("What should SHIP change?", "Provide an explicit goal; discovery did not infer one");
+            if (request === undefined) return;
+            await setNativeDiscoveryGoal(root, request);
+            const next = await startNativeRun(root, ctx.sessionManager.getSessionId(), routing(ctx));
+            if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next);
+            ctx.ui.notify(next.startsWith("SHIP OMP-native") ? "SHIP explicit goal set; planning change." : next, next.startsWith("SHIP blocked") ? "warning" : "info");
             return;
           }
           if (action === "recover") {
             if (ctx.agent.kind !== "main") throw new Error("Recover SHIP from the main OMP session");
-            if (!await ctx.ui.confirm("Destructively recover dead OMP work?", "Only continue after confirming the former OMP session AND every outstanding worker are dead; SHIP cannot inspect OMP worker liveness. Pending assignments will be marked failed, their paid attempts consumed, and the batch transferred to this session; recovery may immediately dispatch another paid assignment. A budget-blocked review remains pending. Recovery refuses a live SHIP lock owner.")) return;
+            if (!await ctx.ui.confirm("Recover confirmed-dead OMP work?", "Only continue after confirming the former OMP session AND every outstanding worker are dead; SHIP cannot inspect OMP worker liveness. Pending discovery research is reassigned with a new ID, without creating a goal or plan. Pending task assignments will be marked failed, their paid attempts consumed, and the batch transferred to this session; recovery may immediately dispatch another paid assignment. A budget-blocked review remains pending. Recovery refuses a live SHIP lock owner.")) return;
             if (await exists(path.join(shipDir(root), "lock"))) await recoverLock(root);
             const next = await recoverNativeRun(root, ctx.sessionManager.getSessionId(), routing(ctx));
-            if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
-            ctx.ui.notify(next.startsWith("SHIP OMP-native") ? "SHIP recovered dead work and sent the next assignment to this OMP session." : next, next.startsWith("SHIP blocked") ? "warning" : "info");
+            if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next);
+            ctx.ui.notify(next.startsWith("SHIP OMP-native discovery") ? "SHIP recovered read-only discovery; awaiting research in this OMP session." : next.startsWith("SHIP OMP-native") ? "SHIP recovered dead work and sent the next assignment to this OMP session." : next, next.startsWith("SHIP blocked") ? "warning" : "info");
             return;
           }
           if (action === "status") {
             const s = await loadState(root);
             const taskCount = s.milestones.reduce((count, milestone) => count + milestone.slices.reduce((n, slice) => n + slice.tasks.length, 0), 0);
-            ctx.ui.notify(`${s.projectName}: ${s.phase}${s.paused ? " (paused)" : ""}; roadmap r${s.roadmapRevision}, ${taskCount} tasks, ${s.dispatches ?? 0} dispatches${s.nativeBatch ? `; native batch ${s.nativeBatch.id} (${s.nativeBatch.stage})` : ""}${s.blockedReason ? `; blocked: ${s.blockedReason}` : ""}`, s.phase === "blocked" ? "warning" : "info");
+            ctx.ui.notify(`${s.projectName}: ${s.phase}${s.discovery ? `; discovery ${s.discovery.status}${s.discovery.goalSet ? " (explicit goal set)" : " (no goal)"}` : ""}${s.paused ? " (paused)" : ""}; roadmap r${s.roadmapRevision}, ${taskCount} tasks, ${s.dispatches ?? 0} dispatches${s.nativeBatch ? `; native batch ${s.nativeBatch.id} (${s.nativeBatch.stage})` : ""}${s.blockedReason ? `; blocked: ${s.blockedReason}` : ""}`, s.phase === "blocked" ? "warning" : "info");
             return;
           }
           if (action === "run") {
             if (ctx.agent.kind !== "main") throw new Error("Run SHIP from the main OMP session");
             if (!await ctx.ui.confirm("Start Ship in this OMP session?", "Dispatch ready tasks using OMP task agents? Model calls may be paid.")) return;
             const next = await startNativeRun(root, ctx.sessionManager.getSessionId(), routing(ctx));
-            if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next, { deliverAs: "followUp" });
+            if (next.startsWith("SHIP OMP-native")) api.sendUserMessage(next);
             ctx.ui.notify(next.startsWith("SHIP OMP-native") ? "SHIP native planning/task assignment sent to this OMP session." : next, next.startsWith("SHIP blocked") ? "warning" : "info");
             return;
           }

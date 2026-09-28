@@ -7,15 +7,16 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import ship, { createShipExtension } from "../extensions/ship.ts";
 import { fixture, plan } from "./helpers.ts";
-import { completeNativeJudgment, recoverNativeRun, reviewVerdict, startNativeRun } from "../src/native-execution.ts";
+import { completeNativeJudgment, recoverNativeRun, reviewVerdict, setNativeDiscoveryGoal, startNativeRun, submitNativeDiscovery } from "../src/native-execution.ts";
 import { parsePlan } from "../src/model.ts";
 import { atomicJson, configPath, exists, loadConfig, loadState, queueRoadmapEdit, saveState, statePath } from "../src/store.ts";
 import { git } from "../src/git.ts";
 
 function harness(extension = ship, jev = false) {
   let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+  let completions: ((prefix: string) => { label: string; value: string; description?: string }[] | null) | undefined;
   type ToolRunner = (id: string, params: unknown, signal: AbortSignal | undefined, update: undefined, ctx: ExtensionContext) => Promise<{ content: { type: string; text: string }[]; isError?: boolean }>;
-  let report: ToolRunner | undefined, submit: ToolRunner | undefined, judgment: ToolRunner | undefined;
+  let report: ToolRunner | undefined, submit: ToolRunner | undefined, judgment: ToolRunner | undefined, discovery: ToolRunner | undefined;
   let spawnHook: ((event: { spawnKey?: string; agent: string; invocationKind: "task" }, ctx: ExtensionContext) => Promise<{ model?: string; block?: boolean; reason?: string } | undefined>) | undefined;
   const resultHooks: ((event: { toolName: string; input: Record<string, unknown>; details: unknown; isError: boolean }, ctx: ExtensionContext) => Promise<void>)[] = [];
   const messages: string[] = [];
@@ -29,16 +30,19 @@ function harness(extension = ship, jev = false) {
       else if (event === "tool_result") resultHooks.push(callback as unknown as typeof resultHooks[number]);
       else assert.fail(`Unexpected extension event: ${event}`);
     },
-    registerCommand(name: string, options: { handler: typeof handler }) { assert.equal(name, "ship"); handler = options.handler; },
+    registerCommand(name: string, options: { handler: typeof handler; getArgumentCompletions?: typeof completions }) {
+      assert.equal(name, "ship"); handler = options.handler; completions = options.getArgumentCompletions;
+    },
     registerTool(tool: { name: string; execute: ToolRunner }) {
       if (tool.name === "ship_outcome") report = tool.execute;
       else if (tool.name === "ship_plan") submit = tool.execute;
       else if (tool.name === "ship_judgment") judgment = tool.execute;
+      else if (tool.name === "ship_discovery") discovery = tool.execute;
     },
     sendUserMessage(message: string) { messages.push(message); },
   } as unknown as ExtensionAPI);
-  assert.ok(handler); assert.ok(report); assert.ok(submit); assert.ok(spawnHook); assert.equal(resultHooks.length, 2);
-  return { handle: handler, report: report, submit: submit, judgment: judgment!, spawnHook: spawnHook,
+  assert.ok(handler); assert.ok(completions); assert.ok(report); assert.ok(submit); assert.ok(discovery); assert.ok(spawnHook); assert.equal(resultHooks.length, 2);
+  return { handle: handler, completions, report: report, submit: submit, discovery: discovery!, judgment: judgment!, spawnHook: spawnHook,
     resultHook: async (event: Parameters<typeof resultHooks[number]>[0], ctx: ExtensionContext) => { for (const hook of resultHooks) await hook(event, ctx); }, messages };
 }
 function command(extension = ship) { return harness(extension).handle; }
@@ -101,6 +105,164 @@ test("/ship init starts native planning and refuses to replace existing project 
   assert.equal((await loadState(root)).phase, "planning");
 });
 
+test("smart init ignores bookkeeping and discovers existing source without a goal", async t => {
+  const metadata = await mkdtemp(path.join(tmpdir(), "ship-init-metadata-"));
+  t.after(() => rm(metadata, { recursive: true, force: true }));
+  await mkdir(path.join(metadata, ".git"));
+  await mkdir(path.join(metadata, "node_modules"));
+  await writeFile(path.join(metadata, ".gitignore"), ".ship\n");
+  const blank = context(metadata);
+  await harness().handle("init", blank.ctx);
+  assert.equal(await exists(path.join(metadata, ".ship")), false);
+  const root = await mkdtemp(path.join(tmpdir(), "ship-init-discovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "src"));
+  await writeFile(path.join(root, "src", "app.ts"), "export const live = true;\n");
+  const api = harness(), ui = context(root);
+  await api.handle("init", ui.ctx);
+  const state = await loadState(root);
+  assert.equal(state.phase, "idle");
+  assert.equal(state.discovery?.status, "researching");
+  assert.equal(await exists(path.join(root, ".ship", "PROJECT.md")), false);
+  assert.equal(await exists(path.join(root, ".ship", "DISCOVERY.md")), false);
+  assert.match(api.messages[0], /agent "scout".*READ-ONLY reconnaissance/);
+  await api.handle("run", ui.ctx);
+  assert.match(ui.notices.at(-1)?.message ?? "", /no explicit goal/);
+  assert.equal((await loadState(root)).nativePlanning, undefined);
+  assert.equal((await loadState(root)).dispatches, 0);
+});
+
+test("discovery approval, cancellation, stale correlation and later explicit goal", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "ship-discovery-approval-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(root, "package.json"), "{\"name\":\"existing\"}\n");
+  const api = harness(), ui = context(root);
+  await api.handle("init", ui.ctx);
+  const id = (await loadState(root)).discovery!.id;
+  const summary = "# Existing project\n\n- `package.json` identifies an existing package.\n- Runtime behavior remains unknown.";
+  const foreign = { ...ui.ctx, sessionManager: { getSessionId: () => "foreign-session" } } as unknown as ExtensionContext;
+  assert.equal((await api.discovery("x", { discoveryId: id, summary }, undefined, undefined, foreign)).isError, true);
+  assert.equal((await api.discovery("x", { discoveryId: "stale", summary }, undefined, undefined, ui.ctx)).isError, true);
+  ui.confirm(false);
+  assert.match((await api.discovery("x", { discoveryId: id, summary }, undefined, undefined, ui.ctx)).content[0].text, /cancelled/);
+  assert.equal((await loadState(root)).discovery?.status, "cancelled");
+  assert.equal((await api.discovery("x", { discoveryId: id, summary }, undefined, undefined, ui.ctx)).isError, true);
+  assert.equal(await exists(path.join(root, ".ship", "DISCOVERY.md")), false);
+  await api.handle("init", ui.ctx);
+  const restarted = (await loadState(root)).discovery!.id;
+  assert.notEqual(restarted, id);
+  ui.confirm(true);
+  assert.equal((await api.discovery("x", { discoveryId: restarted, summary }, undefined, undefined, ui.ctx)).isError, undefined);
+  assert.equal(await readFile(path.join(root, ".ship", "DISCOVERY.md"), "utf8"), summary + "\n");
+  assert.equal((await api.discovery("x", { discoveryId: restarted, summary }, undefined, undefined, ui.ctx)).isError, true);
+  const second = harness(), later = context(root);
+  await second.handle("status", later.ctx);
+  assert.match(later.notices.at(-1)?.message ?? "", /discovery approved \(no goal\)/);
+  await second.handle("run", later.ctx);
+  assert.equal((await loadState(root)).nativePlanning, undefined);
+  await second.handle('change "improve existing package checks"', later.ctx);
+  assert.equal((await loadState(root)).discovery?.goalSet, true);
+  assert.equal((await loadState(root)).phase, "planning");
+  assert.equal(await readFile(path.join(root, ".ship", "PROJECT.md"), "utf8"), "improve existing package checks\n");
+  assert.match(second.messages.at(-1) ?? "", /OMP-native planning/);
+});
+
+test("nested smart init uses the Git root rather than creating a nested project", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "ship-nested-init-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await git(root, ["init", "-b", "main"]);
+  const nested = path.join(root, "src", "feature");
+  await mkdir(nested, { recursive: true });
+  await writeFile(path.join(root, "package.json"), "{\"name\":\"root-project\"}\n");
+  const api = harness(), ui = context(nested);
+  await api.handle("init", ui.ctx);
+  assert.equal((await loadState(root)).discovery?.status, "researching");
+  assert.equal(await exists(path.join(nested, ".ship")), false);
+  assert.match(api.messages[0], /agent "scout"/);
+  assert.match(api.messages[0], /READ-ONLY reconnaissance/);
+});
+
+test("unapproved and cancelled discovery cannot set a goal or dispatch planning", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "ship-unapproved-goal-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(root, "package.json"), "{\"name\":\"existing\"}\n");
+  const api = harness(), ui = context(root);
+  await api.handle("init", ui.ctx);
+  await api.handle('add "premature goal"', ui.ctx);
+  assert.match(ui.notices.at(-1)?.message ?? "", /Approved discovery-only state/);
+  assert.equal(await exists(path.join(root, ".ship", "PROJECT.md")), false);
+  const id = (await loadState(root)).discovery!.id;
+  ui.confirm(false);
+  await api.discovery("x", { discoveryId: id, summary: "Existing package" }, undefined, undefined, ui.ctx);
+  await api.handle('change "cancelled goal"', ui.ctx);
+  assert.match(ui.notices.at(-1)?.message ?? "", /Approved discovery-only state/);
+  const state = await loadState(root);
+  assert.equal(state.discovery?.status, "cancelled");
+  assert.equal(state.discovery?.goalSet, undefined);
+  assert.equal(state.nativePlanning, undefined);
+  assert.equal(await exists(path.join(root, ".ship", "PROJECT.md")), false);
+});
+
+test("retries an approved goal after PROJECT.md was written but state was not saved", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "ship-goal-retry-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(root, "package.json"), "{\"name\":\"existing\"}\n");
+  const api = harness(), ui = context(root);
+  await api.handle("init", ui.ctx);
+  const id = (await loadState(root)).discovery!.id;
+  await api.discovery("x", { discoveryId: id, summary: "Existing package" }, undefined, undefined, ui.ctx);
+  await writeFile(path.join(root, ".ship", "PROJECT.md"), "approved goal\n");
+  await assert.rejects(setNativeDiscoveryGoal(root, "different goal"), /different goal/);
+  assert.equal((await loadState(root)).discovery?.goalSet, undefined);
+  await setNativeDiscoveryGoal(root, "approved goal");
+  assert.equal((await loadState(root)).discovery?.goalSet, true);
+  assert.equal(await readFile(path.join(root, ".ship", "PROJECT.md"), "utf8"), "approved goal\n");
+});
+
+test("confirmed-dead pending discovery recovers with new correlation and no goal", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "ship-discovery-recover-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(root, "package.json"), "{\"name\":\"existing\"}\n");
+  const api = harness(), ui = context(root);
+  await api.handle("init", ui.ctx);
+  const old = (await loadState(root)).discovery!.id;
+  ui.confirm(false);
+  await api.handle("recover", ui.ctx);
+  assert.equal((await loadState(root)).discovery?.id, old);
+  ui.confirm(true);
+  await api.handle("recover", ui.ctx);
+  const next = (await loadState(root)).discovery!;
+  assert.notEqual(next.id, old);
+  assert.equal(next.status, "researching");
+  assert.equal(next.goalSet, undefined);
+  assert.equal((await loadState(root)).nativePlanning, undefined);
+  assert.equal(await exists(path.join(root, ".ship", "PROJECT.md")), false);
+  assert.match(api.messages.at(-1) ?? "", new RegExp(next.id));
+  assert.equal((await api.discovery("x", { discoveryId: old, summary: "Stale research" }, undefined, undefined, ui.ctx)).isError, true);
+  assert.equal((await api.discovery("x", { discoveryId: next.id, summary: "Current research" }, undefined, undefined, ui.ctx)).isError, undefined);
+  assert.equal((await loadState(root)).discovery?.status, "approved");
+});
+
+test("an interrupted discovery write can be reviewed and approved after recovery", async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "ship-discovery-interrupted-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(root, "package.json"), "{\"name\":\"existing\"}\n");
+  const api = harness(), ui = context(root);
+  await api.handle("init", ui.ctx);
+  const orphaned = "# Existing package\n\nPurpose not yet known.\n";
+  await writeFile(path.join(root, ".ship", "DISCOVERY.md"), orphaned);
+  await api.handle("recover", ui.ctx);
+  const id = (await loadState(root)).discovery!.id;
+  let reviewed = "";
+  const result = await submitNativeDiscovery(root, "test-session", id, "New research says something different",
+    async summary => { reviewed = summary; return true; });
+  assert.match(result, /approved/);
+  assert.match(reviewed, /unapproved DISCOVERY\.md survived/);
+  assert.match(reviewed, /Purpose not yet known/);
+  assert.equal((await loadState(root)).discovery?.status, "approved");
+  assert.equal(await readFile(path.join(root, ".ship", "DISCOVERY.md"), "utf8"), orphaned);
+});
+
 test("pre-native config retains budgets while ignoring obsolete RPC worker settings", async t => {
   const root = await fixture(t), config = await loadConfig(root);
   config.limits.maxDispatches = 1;
@@ -126,6 +288,17 @@ test("/ship recover refuses a live owner and clears only a confirmed-dead lock",
   assert.equal(await exists(lock), true);
   ui.confirm(true); await handle("recover", ui.ctx);
   assert.equal(await exists(lock), false);
+});
+
+test("/ship suggests subcommands by prefix and falls back after the first argument", () => {
+  const { completions } = harness();
+  const all = completions("");
+  assert.deepEqual(all?.map(item => item.label), ["add", "change", "run", "status", "pause", "resume", "init", "recover", "help"]);
+  assert.deepEqual(completions("ST"), [{ label: "status", value: "status ", description: "Inspect project progress" }]);
+  assert.deepEqual(completions("r")?.map(item => item.label), ["run", "resume", "recover"]);
+  assert.equal(completions("unknown"), null);
+  assert.equal(completions("add "), null);
+  assert.equal(completions("change fix"), null);
 });
 
 test("/ship help and status report actual project state from a nested directory", async t => {

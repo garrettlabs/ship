@@ -31,6 +31,15 @@ function validateNativeState(s: ShipState): void {
   const count = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
   if (!["idle", "planning", "executing", "verifying", "reviewing", "blocked", "complete"].includes(s.phase)) invalid("phase");
   if (!count(s.roadmapRevision) || (s.dispatches !== undefined && !count(s.dispatches)) || (s.planningFailures !== undefined && !count(s.planningFailures))) invalid("counters");
+  if (s.discovery !== undefined) {
+    const d = s.discovery;
+    if (!record(d) || !label(d.id) || !label(d.sessionId) ||
+        !["researching", "cancelled", "approved"].includes(d.status) ||
+        (d.goalSet !== undefined && typeof d.goalSet !== "boolean") ||
+        (d.goalSet && d.status !== "approved") ||
+        (!d.goalSet && (s.nativePlanning || s.nativeBatch || s.pendingJudgment || s.workspace ||
+          s.activeAttempt || s.milestones.length || s.phase !== "idle"))) invalid("discovery");
+  }
   if (s.nativePlanning !== undefined) {
     const p = s.nativePlanning;
     if (!record(p) || !label(p.id) || !label(p.sessionId) || !count(p.attempts) || s.nativeBatch || s.milestones.length || !["planning", "blocked", "idle"].includes(s.phase)) invalid("planning assignment");
